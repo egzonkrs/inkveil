@@ -1,0 +1,17 @@
+[package]
+name = "inkveil-spell"
+description = "Offline spellchecking for Inkveil, with a bundled en-US dictionary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+spellbook = "0.4"
+unicode-segmentation.workspace = true
+
+[lints]
+workspace = true

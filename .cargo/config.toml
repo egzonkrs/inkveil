@@ -1,0 +1,5 @@
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+# Control Flow Guard: Windows checks indirect calls against a table of valid targets, which
+# blocks a common class of memory-corruption exploits. Combined with the default ASLR, DEP and
+# high-entropy address space.
+rustflags = ["-C", "control-flow-guard"]

@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/egzonkrs/inkveil"
+authors = ["Egzon Krasniqi"]
+publish = false
+
+[workspace.dependencies]
+inkveil-crypto = { path = "crates/inkveil-crypto" }
+inkveil-doc = { path = "crates/inkveil-doc" }
+inkveil-platform = { path = "crates/inkveil-platform" }
+inkveil-spell = { path = "crates/inkveil-spell" }
+inkveil-store = { path = "crates/inkveil-store" }
+
+# GPUI is pinned to the exact commit of Zed release v1.25.3 (a tag could be moved; a commit
+# cannot). Upgrade deliberately and re-test.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "8dd255c3eafb5231056fe4e6f601cedd011f1c93" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "8dd255c3eafb5231056fe4e6f601cedd011f1c93" }
+
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+hkdf = "0.13"
+raw-window-handle = "0.6"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+subtle = "2.6"
+thiserror = "2"
+tracing = "0.1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"
+zeroize = { version = "1.9", features = ["derive"] }
+
+proptest = "1.12"
+tempfile = "3.27"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "warn"
+todo = "warn"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+# Keep unwinding so a panic on a background thread (e.g. storage) can be caught and reported
+# instead of killing the process; the panic hook also waits for queued saves.
+panic = "unwind"
+
+[profile.dev.package."*"]
+# Argon2 and SQLite are painfully slow unoptimized, which makes tests crawl.
+opt-level = 2
