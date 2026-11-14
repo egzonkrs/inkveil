@@ -7,10 +7,11 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, GlobalFree, HANDLE, HGLOBAL, HLOCAL, HWND, LPARAM, LRESULT, LocalFree,
-            RECT, WPARAM,
+            POINT, RECT, WPARAM,
         },
         Graphics::Gdi::{
-            GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+            GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+            MONITORINFO, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
         },
         Security::{
             ACL,
@@ -45,22 +46,25 @@ use windows::{
             },
         },
         UI::{
-            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+            HiDpi::{
+                AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI,
+            },
             WindowsAndMessaging::{
                 CallWindowProcW, DefWindowProcW, GWL_EXSTYLE, GWL_STYLE, GWLP_WNDPROC,
                 GetClientRect, GetPropW, GetWindowLongW, GetWindowPlacement, GetWindowRect,
-                IsIconic, IsZoomed, RemovePropW, SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
-                SetPropW, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPlacement,
-                SetWindowPos, USER_DEFAULT_SCREEN_DPI, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WINDOWPLACEMENT, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
-                WM_NCDESTROY, WM_SIZE, WNDPROC,
+                IsIconic, IsZoomed, PostMessageW, RemovePropW, SIZE_MAXIMIZED, SWP_NOACTIVATE,
+                SWP_NOZORDER, SetPropW, SetWindowDisplayAffinity, SetWindowLongPtrW,
+                SetWindowPlacement, SetWindowPos, USER_DEFAULT_SCREEN_DPI, WDA_EXCLUDEFROMCAPTURE,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_DISPLAYCHANGE,
+                WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVE, WM_NCDESTROY,
+                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WNDPROC,
             },
         },
     },
     core::{BOOL, PCWSTR, PWSTR, w},
 };
 
-use crate::{PlatformError, Support};
+use crate::{PlatformError, Support, fit};
 
 pub(crate) fn exclude_from_capture(
     window: &impl HasWindowHandle,
@@ -442,38 +446,44 @@ const HOOK_PROP: PCWSTR = w!("InkveilWindowHookState");
 /// Smallest window the adjustments below produce, in logical pixels.
 const MIN_LOGICAL_WIDTH: i32 = 640;
 const MIN_LOGICAL_HEIGHT: i32 = 420;
-/// Share of a monitor's work area a window keeps at least and at most when it changes monitors.
-const MIN_WORK_RATIO: f64 = 0.35;
-const MAX_WORK_RATIO: f64 = 0.88;
+/// Posted to the window to look at its place once everything else about a change is done: what
+/// Windows and GPUI do after a DPI change, a restore or a keyboard move has happened by then.
+const WM_SETTLE: u32 = WM_APP + 0x2A1;
+/// The `WM_SYSCOMMAND` value for restoring a window; the low four bits are used by Windows.
+const SC_RESTORE_COMMAND: usize = 0xF120;
+/// A size difference smaller than this, in logical pixels, is rounding, not the user resizing.
+const SAME_SIZE: f64 = 8.;
 
 /// Per-window state of the hook, owned by the window property `HOOK_PROP`.
 struct WindowHookState {
     prev_wndproc: WNDPROC,
-    /// The monitor the window was last moved on or maximized on.
-    monitor: HMONITOR,
-    move_start: Option<MoveStart>,
+    /// Where the window was when the current move or resize (with the mouse) started.
+    move_start: Option<Place>,
+    /// Where the window last came to rest, while not maximized.
+    settled: Option<Place>,
+    /// A `WM_SETTLE` is on its way.
+    settle_queued: bool,
+    /// The hook is moving the window itself; what that causes is not a new move.
+    settling: bool,
 }
 
-/// The window when a move or resize started.
+/// A window's size on a monitor.
 #[derive(Clone, Copy)]
-struct MoveStart {
+struct Place {
     width: i32,
     height: i32,
     monitor: HMONITOR,
     dpi: u32,
 }
 
-impl MoveStart {
+impl Place {
     fn of(hwnd: HWND) -> Option<Self> {
         // SAFETY: `hwnd` is live.
         let rect = if unsafe { IsZoomed(hwnd) }.as_bool() {
             // Dragging a maximized window restores it to this size first.
             placement(hwnd)?.rcNormalPosition
         } else {
-            let mut rect = RECT::default();
-            // SAFETY: `hwnd` is live and `rect` is a valid out pointer.
-            unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
-            rect
+            window_rect(hwnd)?
         };
         Some(Self {
             width: rect.right - rect.left,
@@ -482,6 +492,13 @@ impl MoveStart {
             monitor: unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) },
             dpi: window_dpi(hwnd),
         })
+    }
+
+    fn logical_size(&self) -> (f64, f64) {
+        (
+            fit::logical(self.width, self.dpi),
+            fit::logical(self.height, self.dpi),
+        )
     }
 }
 
@@ -493,9 +510,10 @@ pub(crate) fn configure_window(window: &impl HasWindowHandle) -> Result<Support,
     }
     let state = Box::into_raw(Box::new(WindowHookState {
         prev_wndproc: None,
-        // SAFETY: `hwnd` is a live window.
-        monitor: unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) },
         move_start: None,
+        settled: None,
+        settle_queued: false,
+        settling: false,
     }));
     // The state goes in place before the hook, so the hook always finds it.
     // SAFETY: `hwnd` is live; the property holds `state` until `WM_NCDESTROY` frees it.
@@ -525,6 +543,8 @@ pub(crate) fn configure_window(window: &impl HasWindowHandle) -> Result<Support,
     // SAFETY: `prev` is the non-zero window procedure Windows returned; `WNDPROC` is an optional
     // function pointer of the same size. `state` is valid and only used on this thread.
     unsafe { (*state).prev_wndproc = std::mem::transmute::<isize, WNDPROC>(prev) };
+    // Where it starts counts as where it rests.
+    queue_settle(hwnd, state);
     Ok(Support::Full)
 }
 
@@ -541,25 +561,42 @@ unsafe extern "system" fn hook_wndproc(
     }
     // SAFETY: `state` is the live hook state; it is only touched on this window's thread.
     let prev = unsafe { (*state).prev_wndproc };
-    if msg == WM_NCDESTROY {
-        // SAFETY: the window is going away: unhook, free the state (nothing reads it after
-        // this), then let GPUI run its own cleanup.
-        unsafe {
-            let _ = RemovePropW(hwnd, HOOK_PROP);
-            if let Some(proc) = prev {
-                SetWindowLongPtrW(
-                    hwnd,
-                    GWLP_WNDPROC,
-                    (proc as *const () as usize).cast_signed(),
-                );
+    match msg {
+        WM_NCDESTROY => {
+            // SAFETY: the window is going away: unhook, free the state (nothing reads it after
+            // this), then let GPUI run its own cleanup.
+            unsafe {
+                let _ = RemovePropW(hwnd, HOOK_PROP);
+                if let Some(proc) = prev {
+                    SetWindowLongPtrW(
+                        hwnd,
+                        GWLP_WNDPROC,
+                        (proc as *const () as usize).cast_signed(),
+                    );
+                }
+                drop(Box::from_raw(state));
+                return CallWindowProcW(prev, hwnd, msg, wparam, lparam);
             }
-            drop(Box::from_raw(state));
-            return CallWindowProcW(prev, hwnd, msg, wparam, lparam);
         }
-    }
-    if msg == WM_ENTERSIZEMOVE {
-        // SAFETY: as above.
-        unsafe { (*state).move_start = MoveStart::of(hwnd) };
+        WM_SETTLE => {
+            // SAFETY: as above.
+            unsafe { (*state).settle_queued = false };
+            settle(hwnd, state, None);
+            return LRESULT(0);
+        }
+        WM_ENTERSIZEMOVE => {
+            // SAFETY: as above.
+            unsafe { (*state).move_start = Place::of(hwnd) };
+        }
+        // The restore button, a double click on the title bar, Win+Down: before Windows
+        // restores the window, its restore size must fit the monitor it is on now.
+        // SAFETY: `hwnd` is live.
+        WM_SYSCOMMAND
+            if wparam.0 & 0xFFF0 == SC_RESTORE_COMMAND && unsafe { IsZoomed(hwnd) }.as_bool() =>
+        {
+            fit_restore_size(hwnd, state);
+        }
+        _ => {}
     }
 
     // SAFETY: GPUI's window procedure with the arguments Windows passed in.
@@ -570,10 +607,29 @@ unsafe extern "system" fn hook_wndproc(
     if state.is_null() {
         return result;
     }
+    // SAFETY: as above.
+    let (moving, settling) = unsafe { ((*state).move_start.is_some(), (*state).settling) };
     match msg {
-        WM_DPICHANGED => fix_maximized_client_size(hwnd, prev),
-        WM_EXITSIZEMOVE => keep_share_after_move(hwnd, state),
-        WM_SIZE if wparam.0 == SIZE_MAXIMIZED as usize => fit_restore_size(hwnd, state),
+        WM_DPICHANGED => {
+            fix_maximized_client_size(hwnd, prev);
+            // While the mouse is dragging the window it is left alone, so it never jumps away
+            // from the pointer; the end of the drag takes care of it.
+            if !moving {
+                queue_settle(hwnd, state);
+            }
+        }
+        WM_EXITSIZEMOVE => {
+            // SAFETY: as above.
+            let start = unsafe { (*state).move_start.take() };
+            if start.is_some() {
+                settle(hwnd, state, start);
+            }
+        }
+        // Moves and resizes that are not mouse drags: the keyboard (Win+Shift+Arrow), snapping,
+        // maximizing, restoring, a monitor that was unplugged.
+        WM_SIZE | WM_MOVE | WM_DISPLAYCHANGE | WM_SETTINGCHANGE if !moving && !settling => {
+            queue_settle(hwnd, state);
+        }
         _ => {}
     }
     result
@@ -582,6 +638,19 @@ unsafe extern "system" fn hook_wndproc(
 fn hook_state(hwnd: HWND) -> *mut WindowHookState {
     // SAFETY: `hwnd` is the window the current message is for.
     unsafe { GetPropW(hwnd, HOOK_PROP) }.0.cast()
+}
+
+/// Looks at the window's place once the messages being handled now are done.
+fn queue_settle(hwnd: HWND, state: *mut WindowHookState) {
+    // SAFETY: `state` is the live hook state on its window's thread.
+    if unsafe { (*state).settle_queued } {
+        return;
+    }
+    // SAFETY: posting a message to a live window.
+    if unsafe { PostMessageW(Some(hwnd), WM_SETTLE, WPARAM(0), LPARAM(0)) }.is_ok() {
+        // SAFETY: as above.
+        unsafe { (*state).settle_queued = true };
+    }
 }
 
 /// After a DPI change GPUI sizes a maximized window's content to the whole work area, ignoring
@@ -607,129 +676,176 @@ fn fix_maximized_client_size(hwnd: HWND, prev: WNDPROC) {
     }
 }
 
-/// After the user drags the window to another monitor, keeps its share of the screen. Windows
-/// keeps its size in logical pixels instead, so a window that suits a large monitor covers
-/// nearly all of a small high-DPI laptop screen. Done when the drag ends, so the window never
-/// jumps away from the pointer, and only for moves: a size the user dragged to stays.
-fn keep_share_after_move(hwnd: HWND, state: *mut WindowHookState) {
-    // SAFETY: `state` is the live hook state on its window's thread.
-    let Some(start) = (unsafe { (*state).move_start.take() }) else {
-        return;
-    };
+/// The monitor `hwnd` is on, as [`fit`] needs it.
+fn screen_of(hwnd: HWND) -> Option<(HMONITOR, fit::Screen)> {
     // SAFETY: `hwnd` is live.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    // SAFETY: as above.
-    unsafe { (*state).monitor = monitor };
-    // SAFETY: `hwnd` is live.
-    if start.monitor == monitor
-        || unsafe { IsZoomed(hwnd) }.as_bool()
-        || unsafe { IsIconic(hwnd) }.as_bool()
-    {
-        return;
-    }
-    let mut rect = RECT::default();
-    // SAFETY: `hwnd` is live and `rect` is a valid out pointer.
-    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
-        return;
-    }
+    let work = monitor_work_area(monitor)?;
     let dpi = window_dpi(hwnd);
-    let logical = |pixels: i32, dpi: u32| {
-        f64::from(pixels) * f64::from(USER_DEFAULT_SCREEN_DPI) / f64::from(dpi.max(1))
-    };
-    // Only moves: a size the user dragged to stays.
-    let resized = (logical(start.width, start.dpi) - logical(rect.right - rect.left, dpi)).abs()
-        > 8.
-        || (logical(start.height, start.dpi) - logical(rect.bottom - rect.top, dpi)).abs() > 8.;
-    if resized {
-        return;
-    }
-    let (Some(old_work), Some(work)) =
-        (monitor_work_area(start.monitor), monitor_work_area(monitor))
-    else {
-        return;
-    };
-    let (min_w, min_h) = min_outer_size(hwnd, dpi);
-    #[allow(clippy::cast_possible_truncation)]
-    let scaled = |size: i32, old_work: i32, work: i32, min: i32| {
-        let share =
-            (f64::from(size) / f64::from(old_work.max(1))).clamp(MIN_WORK_RATIO, MAX_WORK_RATIO);
-        ((share * f64::from(work)).round() as i32)
-            .max(min)
-            .min(work)
-    };
-    let width = scaled(
-        start.width,
-        old_work.right - old_work.left,
-        work.right - work.left,
-        min_w,
-    );
-    let height = scaled(
-        start.height,
-        old_work.bottom - old_work.top,
-        work.bottom - work.top,
-        min_h,
-    );
-    // Where it was dropped, moved inside the work area if it now sticks out.
-    let left = rect
-        .left
-        .clamp(work.left, (work.right - width).max(work.left));
-    let top = rect
-        .top
-        .clamp(work.top, (work.bottom - height).max(work.top));
-    // SAFETY: `hwnd` is live; this only moves and sizes it.
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd,
-            None,
-            left,
-            top,
-            width,
-            height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-    };
+    Some((
+        monitor,
+        fit::Screen {
+            work: to_fit(work),
+            dpi,
+            min: min_outer_size(hwnd, dpi),
+        },
+    ))
 }
 
-/// When the window is maximized on another monitor than before, makes sure its restore size fits
-/// there, so un-maximizing on a small screen does not give a second full screen.
-fn fit_restore_size(hwnd: HWND, state: *mut WindowHookState) {
+/// Makes sure the window fits the monitor it came to rest on.
+///
+/// A window that arrived from another monitor keeps the size it had there in logical pixels, as
+/// Windows does, made smaller if it does not fit. Windows normally scales the window itself as
+/// it crosses over; this also covers the moves where it does not, and keeps a window from a
+/// larger screen from hanging off the edges of a smaller one. A window that stays on its monitor
+/// is left alone unless it is larger than the screen. `start` is where a mouse drag began.
+fn settle(hwnd: HWND, state: *mut WindowHookState, start: Option<Place>) {
     // SAFETY: `hwnd` is live.
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    // SAFETY: `state` is the live hook state on its window's thread.
-    if std::mem::replace(unsafe { &mut (*state).monitor }, monitor) == monitor {
+    if unsafe { IsIconic(hwnd) }.as_bool() {
         return;
     }
-    let Some(work) = monitor_work_area(monitor) else {
+    // SAFETY: `state` is the live hook state on its window's thread.
+    if start.is_none() && unsafe { (*state).move_start.is_some() } {
+        // In the middle of a drag; its end settles the window.
+        return;
+    }
+    // SAFETY: `hwnd` is live.
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        fit_restore_size(hwnd, state);
+        // Once restored, it starts afresh from its restore size.
+        let state = hook_state(hwnd);
+        if !state.is_null() {
+            // SAFETY: as above.
+            unsafe { (*state).settled = None };
+        }
+        return;
+    }
+    let (Some((monitor, screen)), Some(rect)) = (screen_of(hwnd), window_rect(hwnd)) else {
+        return;
+    };
+    let rect = to_fit(rect);
+    let from = match start {
+        Some(start) => {
+            // A resize drag keeps the size the user dragged to.
+            let (was_w, was_h) = start.logical_size();
+            let (now_w, now_h) = (
+                fit::logical(rect.width(), screen.dpi),
+                fit::logical(rect.height(), screen.dpi),
+            );
+            let resized = (was_w - now_w).abs() > SAME_SIZE || (was_h - now_h).abs() > SAME_SIZE;
+            (!resized).then_some(start)
+        }
+        // SAFETY: as above.
+        None => unsafe { (*state).settled },
+    };
+    let target = match from.filter(|from| from.monitor != monitor) {
+        Some(from) => fit::arrived(rect, from.logical_size(), &screen),
+        None => fit::stayed(rect, &screen),
+    };
+    if target != rect {
+        // SAFETY: as above; what this move causes is handled here, not queued again.
+        unsafe { (*state).settling = true };
+        // SAFETY: `hwnd` is live; this only moves and sizes it.
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                target.left,
+                target.top,
+                target.width(),
+                target.height(),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+    let state = hook_state(hwnd);
+    if state.is_null() {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe {
+        (*state).settling = false;
+        (*state).settled = Place::of(hwnd);
+    }
+}
+
+/// Gives a maximized window a restore size that fits the monitor it is maximized on, so that
+/// restoring it never makes a window larger than the screen, or one sized for another screen.
+fn fit_restore_size(hwnd: HWND, state: *mut WindowHookState) {
+    let Some((monitor, screen)) = screen_of(hwnd) else {
         return;
     };
     let Some(mut wp) = placement(hwnd) else {
         return;
     };
-    let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
-    let (min_w, min_h) = min_outer_size(hwnd, window_dpi(hwnd));
-    #[allow(clippy::cast_possible_truncation)]
-    let max = |work: i32, min: i32| {
-        ((f64::from(work) * MAX_WORK_RATIO).round() as i32).max(min.min(work))
-    };
-    let (max_w, max_h) = (max(work_w, min_w), max(work_h, min_h));
-    let normal = wp.rcNormalPosition;
-    let (w, h) = (normal.right - normal.left, normal.bottom - normal.top);
-    if w <= max_w && h <= max_h {
+    // The restore rectangle is in workspace coordinates: relative to the primary monitor's
+    // work area, which differs from the screen when the taskbar is at the top or on the left.
+    let (dx, dy) = workspace_origin();
+    let normal = to_fit(wp.rcNormalPosition).offset(dx, dy);
+    let normal_rect = from_fit(normal);
+    // SAFETY: `normal_rect` is a valid rectangle to look a monitor up for.
+    let normal_monitor =
+        unsafe { MonitorFromRect(&raw const normal_rect, MONITOR_DEFAULTTONEAREST) };
+    let fitted = fit::restored(
+        normal,
+        monitor_dpi(normal_monitor),
+        normal_monitor == monitor,
+        &screen,
+    );
+    if fitted == normal {
         return;
     }
-    let (w, h) = (w.min(max_w), h.min(max_h));
-    // Restore positions are in workspace coordinates, which match screen coordinates unless the
-    // taskbar is at the top or left; centring keeps the window on screen either way.
-    let left = work.left + (work_w - w) / 2;
-    let top = work.top + (work_h - h) / 2;
-    wp.rcNormalPosition = RECT {
-        left,
-        top,
-        right: left + w,
-        bottom: top + h,
-    };
+    wp.rcNormalPosition = from_fit(fitted.offset(-dx, -dy));
+    // SAFETY: `state` is the live hook state on its window's thread.
+    unsafe { (*state).settling = true };
     // SAFETY: `wp` came from `GetWindowPlacement`; only the restore rectangle changed.
     let _ = unsafe { SetWindowPlacement(hwnd, &raw const wp) };
+    let state = hook_state(hwnd);
+    if !state.is_null() {
+        // SAFETY: as above.
+        unsafe { (*state).settling = false };
+    }
+}
+
+/// Where workspace coordinates start, in screen coordinates.
+fn workspace_origin() -> (i32, i32) {
+    // SAFETY: a plain lookup of the primary monitor.
+    let primary = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    monitor_work_area(primary).map_or((0, 0), |work| (work.left, work.top))
+}
+
+fn to_fit(rect: RECT) -> fit::Rect {
+    fit::Rect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
+}
+
+fn from_fit(rect: fit::Rect) -> RECT {
+    RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
+}
+
+fn window_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is live and `rect` is a valid out pointer.
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
+    Some(rect)
+}
+
+fn monitor_dpi(monitor: HMONITOR) -> u32 {
+    let (mut x, mut y) = (0, 0);
+    // SAFETY: `x` and `y` are valid out pointers.
+    match unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut x, &raw mut y) } {
+        Ok(()) if x > 0 => x,
+        _ => USER_DEFAULT_SCREEN_DPI,
+    }
 }
 
 fn placement(hwnd: HWND) -> Option<WINDOWPLACEMENT> {

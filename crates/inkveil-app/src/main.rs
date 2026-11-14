@@ -133,6 +133,8 @@ fn main() {
         });
 }
 
+/// The most of the screen a remembered window size may take.
+const MAX_SHARE: f32 = 0.88;
 /// The smallest the window can be made.
 const MIN_WINDOW: (f32, f32) = (640., 420.);
 
@@ -149,11 +151,17 @@ fn initial_window_bounds(
     let window_size = cx.primary_display().map_or(default_size, |display| {
         let visible = display.visible_bounds().size;
         match remembered {
+            // Never more of the screen than a window moved here from another monitor gets, so
+            // its edges can always be reached.
             Some(remembered) => size(
-                remembered.width.min(visible.width).max(min_width).round(),
+                remembered
+                    .width
+                    .min(visible.width * MAX_SHARE)
+                    .max(min_width)
+                    .round(),
                 remembered
                     .height
-                    .min(visible.height)
+                    .min(visible.height * MAX_SHARE)
                     .max(min_height)
                     .round(),
             ),

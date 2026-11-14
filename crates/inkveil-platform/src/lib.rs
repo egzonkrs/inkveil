@@ -14,6 +14,7 @@
 use raw_window_handle::HasWindowHandle;
 use thiserror::Error;
 
+mod fit;
 #[cfg(windows)]
 mod windows;
 
@@ -62,10 +63,11 @@ pub fn exclude_from_capture(window: &impl HasWindowHandle) -> Result<Support, Pl
     }
 }
 
-/// Fixes window sizing across monitors with different sizes and scaling: after the user drags
-/// `window` to another monitor it keeps its share of the screen (instead of nearly filling a
-/// small high-DPI laptop screen), a window maximized on another monitor gets a restore size that
-/// fits there, and a maximized window keeps its status bar on screen after a DPI change.
+/// Fixes window sizing across monitors with different sizes and scaling. When `window` comes to
+/// rest on another monitor, however it got there (a drag, the keyboard, snapping, a monitor
+/// unplugged), it keeps its size in logical pixels and is made smaller if it would not fit, so
+/// its edges can always be reached. Restoring a maximized window gives a size that fits the
+/// monitor it is on, and a maximized window keeps its status bar on screen after a DPI change.
 pub fn configure_window(window: &impl HasWindowHandle) -> Result<Support, PlatformError> {
     #[cfg(windows)]
     {

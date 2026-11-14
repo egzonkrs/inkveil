@@ -78,12 +78,18 @@ Since M5, a copied recovery key stays on the clipboard for two minutes instead o
 so there is time to paste it somewhere safe. [SECURITY.md](../SECURITY.md) describes the current
 behaviour.
 
-A later round of reliability and usability fixes changed three things that touch this review:
+A later round of reliability and usability fixes changed four things that touch this review:
 
 - A plain file, `window-state`, now sits beside the vault folder. It holds the word "maximized"
   or "windowed" and the window's width and height, nothing else.
 - Text fields keep an undo history in memory (wiped on drop). Masked fields (passwords, the API
   key while hidden) keep none.
+- The window hook (N4) was rewritten. A window that comes to rest on another monitor, by a drag,
+  the keyboard, snapping or a monitor being unplugged, keeps its size in logical pixels and is
+  made smaller (to 88% of the work area) only if it does not fit; restoring a maximized window
+  gives a restore size that fits the monitor it is on. Drags are still only adjusted once they
+  end. A test moves an invisible window between two real monitors
+  (`cargo test -p inkveil-platform --test monitors -- --ignored`).
 - A copy that cannot reach the clipboard (another program holds it open) is retried for about a
   tenth of a second and then reported; Cut leaves the text in place when the copy failed. The
   privacy markers and the empty-on-error rule (L5) are unchanged.
