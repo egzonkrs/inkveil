@@ -25,6 +25,10 @@ enum Screen {
 pub struct InkveilApp {
     paths: VaultPaths,
     screen: Screen,
+    /// The storage of a vault that is locking: its last saves are still being written.
+    locking: Option<crate::storage::Storage>,
+    /// Closing was held back once because something was not saved; the next try closes.
+    close_refused: bool,
     focus_handle: FocusHandle,
     _appearance: Subscription,
 }
@@ -38,13 +42,23 @@ impl InkveilApp {
         });
         // Save before the window goes away; quitting alone runs too late to reach the views.
         let this = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            this.update(cx, |app, cx| app.flush_blocking(cx)).ok();
-            true
+        window.on_window_should_close(cx, move |window, cx| {
+            let close = this
+                .update(cx, |app, cx| {
+                    let saved = app.flush_blocking(cx);
+                    app.may_close(saved, cx)
+                })
+                .unwrap_or(true);
+            if close {
+                crate::remember_window(window.window_bounds());
+            }
+            close
         });
         let mut app = Self {
             paths,
             screen: Screen::Busy,
+            locking: None,
+            close_refused: false,
             focus_handle: cx.focus_handle(),
             _appearance: appearance,
         };
@@ -82,7 +96,7 @@ impl InkveilApp {
             Ok(locked) => self.show_unlock(locked, window, cx),
             Err(StoreError::AlreadyOpen) => {
                 self.screen = Screen::Message(
-                    "Inkveil is already open in another window. Close it first.".into(),
+                    "Inkveil is already open in another window. Close it, then try again.".into(),
                 );
             }
             Err(error) => {
@@ -124,23 +138,62 @@ impl InkveilApp {
         let storage = workspace.update(cx, super::workspace::Workspace::prepare_lock);
         drop(workspace);
         crate::images::ImageCache::clear(window, cx);
+        // Kept until the vault is locked, so closing the window meanwhile still waits for it.
+        self.locking = Some(storage.clone());
+        let failed = storage.failed_saves();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let locked = storage.lock().await;
-            this.update_in(cx, |this, window, cx| match locked {
-                Some(locked) => this.show_unlock(locked, window, cx),
-                None => this.open_vault(window, cx),
+            let locked = storage.clone().lock().await;
+            let unsaved = storage.failed_saves() > failed;
+            this.update_in(cx, |this, window, cx| {
+                this.locking = None;
+                match locked {
+                    Some(locked) => this.show_unlock(locked, window, cx),
+                    None => this.open_vault(window, cx),
+                }
+                // Nobody was listening for failed saves any more: say it here.
+                if unsaved && let Screen::Unlock(screen) = &this.screen {
+                    screen.update(cx, |screen, cx| {
+                        screen.show_problem(
+                            "The last changes before locking could not be saved. Unlock to \
+                             check your most recent edits.",
+                            cx,
+                        );
+                    });
+                }
             })
             .ok();
         })
         .detach();
     }
 
-    /// Writes pending saves before the process exits. Returns once done or after a timeout.
-    pub fn flush_blocking(&self, cx: &mut Context<Self>) {
-        if let Screen::Workspace(workspace) = &self.screen {
-            workspace.update(cx, super::workspace::Workspace::flush_blocking);
+    /// Writes pending saves before the process exits. Returns once done or after a timeout,
+    /// and whether everything was saved.
+    pub fn flush_blocking(&self, cx: &mut Context<Self>) -> bool {
+        match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace.update(cx, super::workspace::Workspace::flush_blocking)
+            }
+            // The vault is locking: its saves are queued and only need time.
+            Screen::Busy => self.locking.as_ref().is_none_or(|storage| {
+                storage.wait_idle_blocking(std::time::Duration::from_secs(30))
+            }),
+            _ => true,
         }
+    }
+
+    /// Whether the window may close after a flush that `saved` everything or not. The first
+    /// time something is not saved, the window stays open and says so; the next try closes.
+    fn may_close(&mut self, saved: bool, cx: &mut Context<Self>) -> bool {
+        if saved || self.close_refused {
+            return true;
+        }
+        let Screen::Workspace(workspace) = &self.screen else {
+            return true;
+        };
+        self.close_refused = true;
+        workspace.update(cx, super::workspace::Workspace::report_unsaved_at_close);
+        false
     }
 }
 
@@ -164,11 +217,23 @@ impl Render for InkveilApp {
             Screen::Unlock(view) => root.child(view.clone()),
             Screen::Workspace(view) => root.child(view.clone()),
             Screen::Busy => root,
+            // Whatever was in the way may be gone by now (the other window closed, a file
+            // put back), so the vault can be tried again without restarting.
             Screen::Message(text) => root
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .child(div().max_w(px(480.)).text_center().child(text.clone())),
+                .gap_4()
+                .child(div().max_w(px(480.)).text_center().child(text.clone()))
+                .child(
+                    crate::ui::button("open-again", "Try again", false, cx)
+                        .debug_selector(|| "open-again".to_owned())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_vault(window, cx);
+                            cx.notify();
+                        })),
+                ),
         }
     }
 }

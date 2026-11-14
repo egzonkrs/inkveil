@@ -26,10 +26,19 @@ pub struct AiDialog {
     show_key: bool,
     /// Shown above the fields, e.g. why the dialog opened.
     note: Option<&'static str>,
-    _model_changed: Subscription,
+    /// What had the keyboard before the dialog opened; it gets it back.
+    return_focus: Option<gpui::FocusHandle>,
+    _subscriptions: [Subscription; 3],
 }
 
 impl AiDialog {
+    /// Tab: moves the keyboard between the key and the model field.
+    pub(super) fn focus_other_field(&self, window: &mut Window, cx: &mut gpui::App) {
+        let (key, model) = (self.key.focus_handle(cx), self.model.focus_handle(cx));
+        let next = if key.is_focused(window) { model } else { key };
+        window.focus(&next, cx);
+    }
+
     /// The efforts the model in the model field offers.
     fn efforts(&self, cx: &gpui::App) -> &'static [Effort] {
         model_choice(self.model.read(cx).text()).map_or(OTHER_MODEL_EFFORTS, |m| m.efforts)
@@ -77,6 +86,20 @@ impl Workspace {
                 cx.notify();
             }
         });
+        // Enter in either field saves, like the Save button.
+        let submit = |field: &Entity<TextField>, window: &mut Window, cx: &mut Context<Self>| {
+            cx.subscribe_in(field, window, |this, _, event, window, cx| {
+                if *event == TextFieldEvent::Submitted {
+                    this.save_ai_settings(window, cx);
+                }
+            })
+        };
+        let subscriptions = [
+            model_changed,
+            submit(&key, window, cx),
+            submit(&model, window, cx),
+        ];
+        let return_focus = window.focused(cx);
         window.focus(&key.focus_handle(cx), cx);
         self.ai_dialog = Some(AiDialog {
             key,
@@ -84,8 +107,29 @@ impl Workspace {
             effort: current.effort_or_default(),
             show_key: false,
             note,
-            _model_changed: model_changed,
+            return_focus,
+            _subscriptions: subscriptions,
         });
+        cx.notify();
+    }
+
+    /// Closes the dialog without saving and gives the keyboard back to where it was.
+    pub(super) fn close_ai_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.ai_dialog.take() {
+            self.leave_ai_dialog(dialog.return_focus, window, cx);
+        }
+    }
+
+    fn leave_ai_dialog(
+        &mut self,
+        return_focus: Option<gpui::FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match return_focus {
+            Some(handle) => window.focus(&handle, cx),
+            None => self.focus_main(window, cx),
+        }
         cx.notify();
     }
 
@@ -116,12 +160,11 @@ impl Workspace {
         };
         self.storage.put_state(state_keys::AI, config.encode());
         cx.set_global(config);
-        window.focus(&self.focus_handle, cx);
-        cx.notify();
+        self.leave_ai_dialog(dialog.return_focus, window, cx);
     }
 
     fn remove_ai_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ai_dialog = None;
+        let return_focus = self.ai_dialog.take().and_then(|dialog| dialog.return_focus);
         let current = cx.try_global::<AiConfig>().cloned().unwrap_or_default();
         let config = AiConfig {
             api_key: Zeroizing::default(),
@@ -129,8 +172,7 @@ impl Workspace {
         };
         self.storage.put_state(state_keys::AI, config.encode());
         cx.set_global(config);
-        window.focus(&self.focus_handle, cx);
-        cx.notify();
+        self.leave_ai_dialog(return_focus, window, cx);
     }
 
     pub(super) fn render_ai_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -220,7 +262,12 @@ impl Workspace {
                     .bg(gpui::rgba(0x0000_0088))
                     .child(
                         div()
+                            .id("ai-dialog")
                             .w(px(520.))
+                            // On a small screen it scrolls, so Save and Cancel can be reached.
+                            .max_w(gpui::relative(0.94))
+                            .max_h(gpui::relative(0.94))
+                            .overflow_y_scroll()
                             .p_6()
                             .flex()
                             .flex_col()
@@ -246,9 +293,9 @@ impl Workspace {
                             }))
                             .child(div().text_color(colors.muted).child(
                                 "\"Improve\" and \"Humanize\" send only the text you select, and \
-                                 only when you ask, to OpenRouter, and ask it to use providers \
-                                 that do not store or train on it. Nothing else from your notes \
-                                 leaves this computer. The key is stored encrypted in your vault.",
+                                 Chat only what you type, to OpenRouter, and only to endpoints \
+                                 with zero data retention. Nothing else from your notes leaves \
+                                 this computer. The key is stored encrypted in your vault.",
                             ))
                             .child(label("OPENROUTER API KEY"))
                             .child(
@@ -327,9 +374,7 @@ impl Workspace {
                                     }))
                                     .child(button("cancel-ai", "Cancel", false, cx).on_click(
                                         cx.listener(|this, _, window, cx| {
-                                            this.ai_dialog = None;
-                                            window.focus(&this.focus_handle, cx);
-                                            cx.notify();
+                                            this.close_ai_dialog(window, cx);
                                         }),
                                     ))
                                     .child(button("save-ai", "Save", true, cx).on_click(

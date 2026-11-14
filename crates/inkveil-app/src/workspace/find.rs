@@ -68,6 +68,10 @@ impl NoteEditor {
     /// Opens the find bar (with the replace row for Ctrl+H) and focuses the search field.
     /// Short selected text becomes the search.
     pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // The note is not on screen while the chat fills the editor.
+        if self.chat_open() {
+            return;
+        }
         let prefill = {
             let editor = self.editor.read(cx).editor();
             let selection = editor.selection();
@@ -109,6 +113,8 @@ impl NoteEditor {
             query.update(cx, |field, cx| field.set_text(&text, cx));
         }
         window.focus(&query.focus_handle(cx), cx);
+        // The text to find is selected, so typing replaces it.
+        query.update(cx, TextField::select_everything);
         self.refresh_find(true, cx);
     }
 
@@ -409,25 +415,25 @@ impl NoteEditor {
                     .child(count),
             )
             .child(
-                icon_button(
+                crate::ui::icon_button_state(
                     "find-prev",
                     Icon::ArrowUp,
                     false,
+                    has_matches,
                     "Previous match (Shift+Enter)",
                     cx,
                 )
-                .when(!has_matches, |d| d.opacity(0.4))
                 .on_click(cx.listener(|this, _, window, cx| this.find_step(false, window, cx))),
             )
             .child(
-                icon_button(
+                crate::ui::icon_button_state(
                     "find-next",
                     Icon::ArrowDown,
                     false,
+                    has_matches,
                     "Next match (Enter)",
                     cx,
                 )
-                .when(!has_matches, |d| d.opacity(0.4))
                 .on_click(cx.listener(|this, _, window, cx| this.find_step(true, window, cx))),
             )
             .child(
@@ -472,6 +478,9 @@ impl NoteEditor {
                 .absolute()
                 .top(px(6.))
                 .right(px(28.))
+                // Never wider than the note, as in a narrow split.
+                .max_w(gpui::relative(0.92))
+                .overflow_hidden()
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -508,11 +517,15 @@ fn small_button(
         .rounded_md()
         .border_1()
         .border_color(colors.border)
-        .cursor_pointer()
         .text_size(px(12.))
         .text_color(colors.text)
-        .hover(|d| d.bg(colors.hover))
-        .when(!enabled, |d| d.opacity(0.4))
+        .map(|d| {
+            if enabled {
+                d.cursor_pointer().hover(|d| d.bg(colors.hover))
+            } else {
+                d.opacity(0.4)
+            }
+        })
         .child(crate::ui::icon(icon_name, colors.icon).size(px(14.)))
         .child(label)
 }

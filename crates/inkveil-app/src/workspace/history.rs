@@ -21,6 +21,8 @@ pub struct History {
     preview: Option<Entity<EditorView>>,
     loading: bool,
     error: Option<SharedString>,
+    /// How far the list of versions is scrolled, and its scrollbar.
+    scroll: crate::ui::scrollbar::Scrollbar,
 }
 
 impl NoteEditor {
@@ -36,6 +38,7 @@ impl NoteEditor {
             preview: None,
             loading: true,
             error: None,
+            scroll: crate::ui::scrollbar::Scrollbar::new(),
         });
         cx.notify();
         let storage = self.storage.clone();
@@ -193,9 +196,9 @@ impl NoteEditor {
 
         let mut list = div()
             .id("history-list")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
+            .track_scroll(history.scroll.handle())
             .flex()
             .flex_col()
             .gap(px(1.))
@@ -291,7 +294,14 @@ impl NoteEditor {
                         ),
                     ),
             )
-            .child(list);
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(history.scroll.render(cx)),
+            );
 
         Some(
             div()

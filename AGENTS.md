@@ -17,6 +17,7 @@ under their password. It lives here:
 %LOCALAPPDATA%\Inkveil\update-backups\  ← copies made by scripts\install.ps1 before each update
 <folder chosen in Settings>\Inkveil backups\  ← daily copies of backups\, if one was chosen
 %LOCALAPPDATA%\Inkveil\*-archived-*\    ← older vaults; keep them
+%LOCALAPPDATA%\Inkveil\window-state     ← the window's size, as plain text; not part of the vault
 ```
 
 - **Never delete, move, rename, overwrite, "clean up", reset or recreate anything under
@@ -29,7 +30,8 @@ under their password. It lives here:
   use the real vault.
 - **Update the installed app only with `.\scripts\install.ps1`.** It closes Inkveil politely
   (which saves every note), copies the vault to `update-backups` and checks the copy, and only
-  then replaces the program. If the copy fails, nothing is installed.
+  then replaces the program. If the copy fails, nothing is installed. It shows a warning first,
+  and afterwards checks that every vault file is still identical. Keep both.
 - **If Inkveil shows the setup screen ("create a vault") on a machine that has notes, stop.** Do not
   create a vault: the database has gone missing. The app now refuses to create a vault over a
   folder that still has a key header or backups, but do not test that on the real folder.
@@ -56,7 +58,9 @@ under their password. It lives here:
   capture exclusion, clipboard markers, and `#![forbid(unsafe_code)]` in every crate except
   `inkveil-platform`.
 - The only network code is `crates/inkveil-app/src/ai.rs`: HTTPS to OpenRouter, only the selected
-  text, only when the user clicks Improve or Humanize, after the secret scan.
+  text or what was typed into the chat, only when the user clicks Improve or Humanize or sends a
+  question, after the secret scan. Every request must keep `zdr: true` (`ai::PRIVATE`).
+- The chat's conversation stays in memory: never save it to the vault or disk, and wipe it on lock.
 - Every `unsafe` block states why it is sound.
 - When security behaviour changes, update `SECURITY.md` and `docs/SECURITY-AUDIT.md` to match.
   Write down only what the code does; do not claim protections that are not there.

@@ -68,9 +68,25 @@ before the changes were committed:
 | N5 | If `vault.db` went missing, the app offered setup; a new vault would overwrite `vault.header` and its backup rotation or a password change would delete the old vault's backups. | **Fixed.** Setup is refused while a header or backups remain, with recovery instructions. |
 | N6 | Updates had no safety copy of the vault. | **Fixed.** `install.ps1` copies and verifies the vault first; documented in README, AGENTS.md and RELEASING.md. |
 
+The chat added after this review keeps the same rules, and one finding came out of it:
+
+| # | Finding | Status |
+|---|---|---|
+| N7 | Requests set `data_collection: deny` but not `zdr`, so the docs' claim that providers "do not store" prompts was stronger than what was enforced. | **Fixed.** Every request now sets `provider.zdr`, for Improve and Humanize as well as the chat. |
+
 Since M5, a copied recovery key stays on the clipboard for two minutes instead of 60 seconds,
 so there is time to paste it somewhere safe. [SECURITY.md](../SECURITY.md) describes the current
 behaviour.
+
+A later round of reliability and usability fixes changed three things that touch this review:
+
+- A plain file, `window-state`, now sits beside the vault folder. It holds the word "maximized"
+  or "windowed" and the window's width and height, nothing else.
+- Text fields keep an undo history in memory (wiped on drop). Masked fields (passwords, the API
+  key while hidden) keep none.
+- A copy that cannot reach the clipboard (another program holds it open) is retried for about a
+  tenth of a second and then reported; Cut leaves the text in place when the copy failed. The
+  privacy markers and the empty-on-error rule (L5) are unchanged.
 
 Still open, unchanged: Windows Hello unlock, hiding row counts in the database file, detecting
 deletion of single notes and whole-vault rollback, code signing.

@@ -11,24 +11,37 @@ static LAST_WRITE: Mutex<Option<u32>> = Mutex::new(None);
 /// How long a copied secret (a recovery key) stays on the clipboard.
 pub const SECRET_LIFETIME: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Copies `text`, marked as private where the platform supports it. Returns the clipboard
-/// sequence number of the write, if known.
-pub fn write_text(text: &str, cx: &mut App) -> Option<u32> {
+/// What to tell the user when a copy did not reach the clipboard.
+pub const BUSY: &str = "Could not copy: another program is using the clipboard. Try again.";
+
+/// Copies `text`, marked as private where the platform supports it. Returns whether it reached
+/// the clipboard: another program can hold the clipboard open, and then nothing is copied.
+pub fn write_text(text: &str, cx: &mut App) -> bool {
+    write(text, cx).is_ok()
+}
+
+/// Copies `text` and returns the clipboard sequence number of the write, if known.
+fn write(text: &str, cx: &mut App) -> Result<Option<u32>, ()> {
+    // Tests must not overwrite the clipboard of whoever runs them.
+    if cfg!(test) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+        return Ok(None);
+    }
     match inkveil_platform::write_private_clipboard_text(text) {
         Ok(Some(sequence)) => {
             if let Ok(mut last) = LAST_WRITE.lock() {
                 *last = Some(sequence);
             }
-            Some(sequence)
+            Ok(Some(sequence))
         }
         Ok(None) => {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
-            None
+            Ok(None)
         }
         // The clipboard was left empty rather than holding unmarked text.
         Err(error) => {
             tracing::warn!("private clipboard write failed: {error}");
-            None
+            Err(())
         }
     }
 }
@@ -36,7 +49,7 @@ pub fn write_text(text: &str, cx: &mut App) -> Option<u32> {
 /// Copies a secret (a recovery key) and removes it from the clipboard after
 /// [`SECRET_LIFETIME`], unless something else was copied in the meantime.
 pub fn write_secret_text(text: &str, cx: &mut App) {
-    let Some(sequence) = write_text(text, cx) else {
+    let Ok(Some(sequence)) = write(text, cx) else {
         return;
     };
     cx.spawn(async move |cx| {

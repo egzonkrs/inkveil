@@ -321,6 +321,54 @@ fn typing_at_several_carets_is_one_undo_step() {
 }
 
 #[test]
+fn deleting_words_at_carets_that_reach_the_same_text_deletes_it_once() {
+    // Two carets in one word: both reach back to its start.
+    let mut ed = Editor::new(Document::from_plain_text("alphabet soup"));
+    ed.set_selection(Selection::caret(Pos::new(0, 5)));
+    ed.toggle_caret(Pos::new(0, 8));
+    ed.delete_backward(Unit::Word);
+    assert_eq!(texts(&ed), [" soup"]);
+    assert!(!ed.has_multiple_carets(), "the carets met");
+    ed.undo();
+    assert_eq!(texts(&ed), ["alphabet soup"]);
+
+    // And forwards, to the end of the word.
+    ed.set_selection(Selection::caret(Pos::new(0, 2)));
+    ed.toggle_caret(Pos::new(0, 5));
+    ed.delete_forward(Unit::Word);
+    assert_eq!(texts(&ed), ["al soup"]);
+
+    // Carets on neighbouring lines of one code block, where a word reaches over the line break.
+    let mut ed = Editor::default();
+    ed.set_text_kind(TextKind::Code);
+    type_str(&mut ed, "alpha");
+    ed.split_block();
+    ed.split_block();
+    type_str(&mut ed, "beta");
+    assert_eq!(
+        texts(&ed),
+        ["alpha
+
+beta"]
+    );
+    ed.set_selection(Selection::caret(Pos::new(0, 5)));
+    ed.toggle_caret(Pos::new(0, 6));
+    ed.delete_backward(Unit::Word);
+    assert_eq!(
+        texts(&ed),
+        ["
+beta"]
+    );
+    ed.undo();
+    assert_eq!(
+        texts(&ed),
+        ["alpha
+
+beta"]
+    );
+}
+
+#[test]
 fn carets_move_together_and_toggle_off() {
     let mut ed = Editor::new(Document::from_plain_text("abc\nabc"));
     ed.set_selection(Selection::caret(Pos::new(0, 1)));

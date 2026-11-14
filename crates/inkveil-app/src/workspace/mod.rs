@@ -3,6 +3,9 @@
 mod ai_panel;
 mod ai_settings;
 mod backups;
+mod chat;
+mod chat_selection;
+mod chat_text;
 mod find;
 mod history;
 mod note_editor;
@@ -10,6 +13,10 @@ mod pictures;
 mod sections;
 mod session;
 mod sidebar;
+mod tab_layout;
+mod tabs;
+#[cfg(test)]
+mod ui_tests;
 
 use std::{
     collections::HashMap,
@@ -17,7 +24,7 @@ use std::{
 };
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Render,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseDownEvent, Render,
     SharedString, Task, WeakEntity, Window, actions, anchored, deferred, div, prelude::*, px,
 };
 use inkveil_doc::{Document, Pos};
@@ -27,6 +34,8 @@ use self::{
     note_editor::{NoteEditor, NoteEditorEvent},
     session::{OpenTab, Session},
     sidebar::SidebarState,
+    tab_layout::TabLayout,
+    tabs::TabBarState,
 };
 use crate::{
     app::InkveilApp,
@@ -45,13 +54,17 @@ actions!(
     [
         NewNote,
         CloseTab,
+        ReopenClosedTab,
+        ToggleSplit,
         NextTab,
         PrevTab,
         FocusSearch,
         LockVault,
         TrashNote,
         ToggleWrap,
-        ToggleLineNumbers
+        ToggleLineNumbers,
+        ToggleChat,
+        SaveNow
     ]
 );
 
@@ -60,20 +73,61 @@ const CONTEXT: &str = "Workspace";
 const TRASH_DAYS: i64 = 30;
 const TICK: Duration = Duration::from_millis(250);
 
+/// What is open on top of the notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    /// A menu, the picture viewer or the recovery key: nothing to type into.
+    Menu,
+    /// The AI settings or the link popup: they have text fields.
+    Dialog,
+}
+
+/// Keys that, with Ctrl, edit text in a field (the clipboard, undo, moving by word or to the
+/// ends). Every other Ctrl or Alt shortcut is kept away from what is under a dialog.
+const EDITING_KEYS: [&str; 13] = [
+    "a",
+    "c",
+    "v",
+    "x",
+    "z",
+    "y",
+    "left",
+    "right",
+    "backspace",
+    "delete",
+    "home",
+    "end",
+    "insert",
+];
+
+/// How often a caret that moved, with nothing else about the open tabs changing, is stored.
+const CARET_SAVE_EVERY: Duration = Duration::from_secs(10);
+
+/// How long quitting waits for the last saves. Housekeeping is skipped by then, so this is only
+/// reached when the disk itself is very slow.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub fn key_bindings() -> Vec<gpui::KeyBinding> {
     use gpui::KeyBinding;
     let ctx = Some(CONTEXT);
     let mut bindings = find::key_bindings();
+    bindings.extend(chat::key_bindings());
     bindings.extend([
         KeyBinding::new("ctrl-n", NewNote, ctx),
         KeyBinding::new("ctrl-w", CloseTab, ctx),
         KeyBinding::new("ctrl-f4", CloseTab, ctx),
+        KeyBinding::new("ctrl-shift-t", ReopenClosedTab, ctx),
+        KeyBinding::new("ctrl-shift-s", ToggleSplit, ctx),
         KeyBinding::new("ctrl-tab", NextTab, ctx),
         KeyBinding::new("ctrl-pagedown", NextTab, ctx),
         KeyBinding::new("ctrl-shift-tab", PrevTab, ctx),
         KeyBinding::new("ctrl-pageup", PrevTab, ctx),
         KeyBinding::new("ctrl-p", FocusSearch, ctx),
         KeyBinding::new("ctrl-l", LockVault, ctx),
+        KeyBinding::new("ctrl-j", ToggleChat, ctx),
+        // Notes save themselves; this is for the reflex, and saves at once.
+        KeyBinding::new("ctrl-s", SaveNow, ctx),
         // Same as VS Code.
         KeyBinding::new("alt-z", ToggleWrap, ctx),
         KeyBinding::new("alt-n", ToggleLineNumbers, ctx),
@@ -90,6 +144,13 @@ pub struct Workspace {
     loaded: bool,
     tabs: Vec<Entity<NoteEditor>>,
     active: Option<usize>,
+    /// Pinned tabs and split views.
+    layout: TabLayout<NoteId>,
+    /// Pins and splits from the stored session whose tabs have not opened yet.
+    restoring: TabLayout<NoteId>,
+    /// A note opening in a split view, and the open note it goes beside.
+    pending_split: Option<(NoteId, NoteId)>,
+    tab_bar: TabBarState,
     search: Entity<TextField>,
     /// Notes whose text matches the sidebar search.
     body_hits: HashMap<NoteId, BodyHit>,
@@ -108,13 +169,22 @@ pub struct Workspace {
     /// A freshly created recovery key being shown to the user.
     new_recovery_key: Option<zeroize::Zeroizing<String>>,
     ai_dialog: Option<ai_settings::AiDialog>,
+    /// The chat with its conversation, from the first time it opens until the vault locks.
+    chat: Option<Entity<chat::ChatPanel>>,
+    /// The chat is showing with no note open.
+    chat_alone: bool,
     backups: backups::BackupState,
     session_dirty: bool,
     saved_session: Option<Session>,
+    last_session_write: Instant,
     settings: AppSettings,
     show_settings: bool,
     /// The settings menu was opened from the sidebar's gear (else from the status bar).
     settings_from_sidebar: bool,
+    /// The mouse press being handled is on a button that opens the settings menu. The menu
+    /// then leaves closing to that button: closing on the press and toggling on the click
+    /// would open it again.
+    press_on_settings: bool,
     last_activity: Instant,
     last_activity_wall: SystemTime,
     last_tick_wall: SystemTime,
@@ -123,7 +193,7 @@ pub struct Workspace {
     spell_generation: u64,
     focus_handle: FocusHandle,
     _tasks: Vec<Task<()>>,
-    _keystrokes: gpui::Subscription,
+    _keystrokes: [gpui::Subscription; 2],
 }
 
 impl Workspace {
@@ -138,9 +208,16 @@ impl Workspace {
         crate::storage::set_active(Some(storage.clone()));
 
         let search = cx.new(|cx| TextField::new("Search notes", window, cx));
-        cx.subscribe(&search, |this, _, event, cx| {
-            if *event == crate::ui::text_field::TextFieldEvent::Changed {
-                this.schedule_body_search(cx);
+        cx.subscribe_in(&search, window, |this, _, event, window, cx| {
+            match event {
+                crate::ui::text_field::TextFieldEvent::Changed => {
+                    this.sidebar.show_all = false;
+                    this.schedule_body_search(cx);
+                }
+                crate::ui::text_field::TextFieldEvent::Submitted => {
+                    this.open_first_result(window, cx);
+                }
+                crate::ui::text_field::TextFieldEvent::Blurred => {}
             }
             cx.notify();
         })
@@ -188,7 +265,6 @@ impl Workspace {
                         this.load_backup_folder(
                             backup_folder.ok().flatten().as_deref().map(|b| &b[..]),
                         );
-                        this.storage.run_maintenance();
                         this.loaded = true;
                         this.purge_old_trash();
                         let session = session
@@ -197,6 +273,10 @@ impl Workspace {
                             .map(|bytes| Session::decode(&bytes))
                             .unwrap_or_default();
                         this.restore_session(session, window, cx);
+                        // After the open notes have been asked for: storage works through its
+                        // jobs in order, and the check and tidy-up can take a while in a big
+                        // vault. The notes should not wait behind them.
+                        this.storage.run_maintenance();
                         cx.notify();
                     }
                     Err(error) => this.report_error("loading notes", &error, cx),
@@ -225,6 +305,24 @@ impl Workspace {
 
         cx.set_global(EditorSettings::default());
         let keystrokes = cx.observe_keystrokes(|this, _, _, _| this.touch());
+        // Escape closes whatever is open on top of the notes, before anything under it hears
+        // the key: with a menu showing, Escape must not close the find bar behind it.
+        let this = cx.weak_entity();
+        let escape = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = &event.keystroke;
+            let handled = this
+                .update(cx, |this, cx| {
+                    if key.key == "escape" && !key.modifiers.modified() {
+                        this.dismiss_popup(window, cx)
+                    } else {
+                        this.overlay_takes_key(key, window, cx)
+                    }
+                })
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+            }
+        });
         // Workspace shortcuts (Ctrl+N, Ctrl+L, …) need focus inside the workspace.
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
@@ -236,6 +334,10 @@ impl Workspace {
             loaded: false,
             tabs: Vec::new(),
             active: None,
+            layout: TabLayout::default(),
+            restoring: TabLayout::default(),
+            pending_split: None,
+            tab_bar: TabBarState::default(),
             search,
             body_hits: HashMap::new(),
             search_task: None,
@@ -249,11 +351,15 @@ impl Workspace {
             expired_trash: Vec::new(),
             new_recovery_key: None,
             ai_dialog: None,
+            chat: None,
+            chat_alone: false,
             backups: backups::BackupState::default(),
             session_dirty: false,
+            last_session_write: Instant::now(),
             saved_session: None,
             settings: AppSettings::default(),
             show_settings: false,
+            press_on_settings: false,
             settings_from_sidebar: false,
             last_activity: Instant::now(),
             last_activity_wall: SystemTime::now(),
@@ -263,7 +369,115 @@ impl Workspace {
             spell_generation: 0,
             focus_handle,
             _tasks: vec![load, failures, ticker],
-            _keystrokes: keystrokes,
+            _keystrokes: [keystrokes, escape],
+        }
+    }
+
+    /// Closes the menu, popup or dialog that is open on top of the notes, if there is one.
+    fn dismiss_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.ai_dialog.is_some() {
+            self.close_ai_dialog(window, cx);
+        } else if self.dismiss_tab_menu() {
+            // The tab menu was open and is closed now.
+        } else if self.sidebar.note_menu.is_some() || self.sidebar.section_menu.is_some() {
+            self.sidebar.note_menu = None;
+            self.sidebar.section_menu = None;
+        } else if self.show_settings {
+            self.show_settings = false;
+        } else if self.sidebar.section_field.take().is_some() {
+            // A section name being typed is dropped, as Escape does in any rename field.
+            self.focus_main(window, cx);
+        } else {
+            let tabs = self.tabs.clone();
+            return tabs
+                .iter()
+                .any(|tab| tab.update(cx, |note, cx| note.dismiss_menu(window, cx)));
+        }
+        // Opening a menu with the mouse takes the keyboard away from the note (the click lands
+        // on the tab bar or sidebar). Closing it with Escape gives it back.
+        if self.focus_handle.is_focused(window) {
+            self.focus_main(window, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// What is open on top of the notes, as far as the keyboard is concerned.
+    fn overlay(&self, cx: &App) -> Overlay {
+        if self.ai_dialog.is_some() {
+            return Overlay::Dialog;
+        }
+        if self.new_recovery_key.is_some()
+            || self.tab_bar_menu_open()
+            || self.sidebar.note_menu.is_some()
+            || self.sidebar.section_menu.is_some()
+            || self.show_settings
+        {
+            return Overlay::Menu;
+        }
+        // Only notes on screen count: a menu that cannot be seen must never take the keyboard.
+        let active = self.active_id(cx);
+        let on_screen = |id: NoteId| {
+            active.is_some_and(|active| {
+                active == id
+                    || self
+                        .layout
+                        .split_of(active)
+                        .is_some_and(|split| split.has(id))
+            })
+        };
+        let mut overlay = Overlay::None;
+        for tab in &self.tabs {
+            let note = tab.read(cx);
+            if !on_screen(note.id) {
+                continue;
+            }
+            if note.menu_open() {
+                return Overlay::Menu;
+            }
+            if note.link_popup_open() {
+                overlay = Overlay::Dialog;
+            }
+        }
+        overlay
+    }
+
+    /// Keeps a key away from what is under a menu or dialog. With a menu open, typing must not
+    /// change the note behind it; with a dialog open, its fields work but shortcuts such as
+    /// Ctrl+N or Ctrl+W do not reach the workspace. Returns whether the key stops here.
+    fn overlay_takes_key(
+        &mut self,
+        key: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.overlay(cx) {
+            Overlay::None => false,
+            // Escape still reaches the picture viewer, which closes on it.
+            Overlay::Menu => key.key != "escape",
+            Overlay::Dialog => {
+                if key.key == "tab" {
+                    // Tab stays inside the dialog.
+                    if let Some(dialog) = &self.ai_dialog {
+                        dialog.focus_other_field(window, cx);
+                    }
+                    return true;
+                }
+                let modifiers = key.modifiers;
+                let shortcut = modifiers.control || modifiers.alt || modifiers.platform;
+                shortcut
+                    && !(modifiers.control
+                        && !modifiers.alt
+                        && EDITING_KEYS.contains(&key.key.as_str()))
+            }
+        }
+    }
+
+    /// Gives the keyboard to the note on screen, or to the workspace when there is none.
+    fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active.and_then(|active| self.tabs.get(active)) {
+            Some(tab) => tab.update(cx, |note, cx| note.focus(window, cx)),
+            None => window.focus(&self.focus_handle, cx),
         }
     }
 
@@ -396,6 +610,9 @@ impl Workspace {
     /// Returns false once the vault is locking.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.autosave(false, cx);
+        for tab in &self.tabs {
+            tab.update(cx, NoteEditor::refresh_word_count);
+        }
         // Keep "5 min ago" style times current.
         if self.last_time_refresh.elapsed() >= Duration::from_secs(30) {
             self.last_time_refresh = Instant::now();
@@ -409,9 +626,10 @@ impl Workspace {
             }
         }
         if self.loaded {
-            self.save_session(cx);
+            self.save_session(false, cx);
         }
         self.backup_tick();
+        self.clear_finished_drag(cx);
         if let Some((_, at)) = self.confirm_delete
             && at.elapsed() > Duration::from_secs(4)
         {
@@ -475,18 +693,27 @@ impl Workspace {
             }
         }
         for save in saves {
-            if let Some(summary) = self.notes.iter_mut().find(|n| n.id == save.id) {
-                summary.meta = save.meta.clone();
-            }
-            self.storage.save_note(save.id, save.meta, save.body);
-            if save.snapshot {
-                self.storage.snapshot(save.id);
+            let (id, snapshot) = (save.id, save.snapshot);
+            self.queue_save(save);
+            if snapshot {
+                self.storage.snapshot(id);
             }
         }
     }
 
-    /// Stores open tabs and carets if they changed since the last save.
-    fn save_session(&mut self, cx: &App) {
+    /// Hands a note to storage and shows its new title, preview and time in the sidebar.
+    fn queue_save(&mut self, save: note_editor::PendingSave) {
+        if let Some(summary) = self.notes.iter_mut().find(|n| n.id == save.id) {
+            summary.meta = save.meta.clone();
+        }
+        self.storage.save_note(save.id, save.meta, save.body);
+    }
+
+    /// Stores open tabs and carets if they changed since the last save. A change of tabs or
+    /// their arrangement is stored at once. A caret that only moved waits up to
+    /// [`CARET_SAVE_EVERY`], unless `now` is set: every write is a full commit to disk, and the
+    /// caret moves with every key.
+    fn save_session(&mut self, now: bool, cx: &App) {
         self.session_dirty = false;
         let session = Session {
             tabs: self
@@ -503,16 +730,53 @@ impl Workspace {
                 })
                 .collect(),
             active: self.active.and_then(|a| u32::try_from(a).ok()),
+            pinned: self.layout.pinned.clone(),
+            splits: self.layout.splits.clone(),
         };
-        if self.saved_session.as_ref() != Some(&session) {
-            self.storage
-                .put_state(state_keys::SESSION, session.encode());
-            self.saved_session = Some(session);
+        let Some(saved) = self.saved_session.as_ref() else {
+            // Nothing stored since unlocking: what is on disk is at most as old as this.
+            self.store_session(session);
+            return;
+        };
+        if *saved == session {
+            return;
         }
+        if now
+            || !saved.same_tabs(&session)
+            || self.last_session_write.elapsed() >= CARET_SAVE_EVERY
+        {
+            self.store_session(session);
+        }
+    }
+
+    fn store_session(&mut self, session: Session) {
+        self.storage
+            .put_state(state_keys::SESSION, session.encode());
+        self.saved_session = Some(session);
+        self.last_session_write = Instant::now();
     }
 
     fn restore_session(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
         let active = session.active.map(|a| a as usize);
+        let available = |id: NoteId| {
+            self.notes
+                .iter()
+                .any(|n| n.id == id && n.meta.trashed_ms.is_none())
+        };
+        self.restoring = TabLayout {
+            pinned: session
+                .pinned
+                .iter()
+                .copied()
+                .filter(|id| available(*id))
+                .collect(),
+            splits: session
+                .splits
+                .iter()
+                .copied()
+                .filter(|s| available(s.first) && available(s.second))
+                .collect(),
+        };
         for (index, tab) in session.tabs.into_iter().enumerate() {
             let Some(summary) = self
                 .notes
@@ -612,6 +876,7 @@ impl Workspace {
                     .then_some("Add your OpenRouter API key to use Improve with AI.");
                 this.open_ai_settings(note, window, cx);
             }
+            NoteEditorEvent::ChatToggled => this.toggle_chat(Some(tab.clone()), window, cx),
             NoteEditorEvent::TrashRequested => {
                 let id = tab.read(cx).id;
                 this.trash_note(id, window, cx);
@@ -672,6 +937,8 @@ impl Workspace {
                 if let Some((_, query)) = this.pending_find.take_if(|(p, _)| *p == id) {
                     tab.update(cx, |note, cx| note.find_text(&query, window, cx));
                 }
+                this.apply_restored_layout(cx);
+                this.finish_open_in_split(id, window, cx);
                 this.session_dirty = true;
                 cx.notify();
             })
@@ -696,9 +963,14 @@ impl Workspace {
         }
         // Save before the tab (and its unsaved state) goes away.
         if let Some(save) = self.tabs[index].update(cx, |note, cx| note.take_save(true, cx)) {
-            self.storage.save_note(save.id, save.meta, save.body);
-            self.storage.snapshot(save.id);
+            let id = save.id;
+            self.queue_save(save);
+            self.storage.snapshot(id);
         }
+        let id = self.tabs[index].read(cx).id;
+        let partner = self.layout.split_of(id).map(|s| s.other(id));
+        let was_active = self.active == Some(index);
+        self.forget_tab(id);
         self.tabs.remove(index);
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
@@ -706,6 +978,10 @@ impl Workspace {
             Some(a) => Some(a.min(self.tabs.len() - 1)),
             None => None,
         };
+        // Closing one side of a split leaves the other side on screen.
+        if was_active && let Some(index) = partner.and_then(|p| self.tab_index(p, cx)) {
+            self.active = Some(index);
+        }
         if let Some(a) = self.active {
             self.tabs[a].update(cx, |note, cx| note.focus(window, cx));
         } else {
@@ -760,23 +1036,40 @@ impl Workspace {
     /// Queues every unsaved change and the session, and returns storage for locking.
     pub fn prepare_lock(&mut self, cx: &mut Context<Self>) -> Storage {
         self.autosave(true, cx);
-        self.save_session(cx);
+        self.save_session(true, cx);
         RichClipboard::clear(cx);
         crate::clipboard::clear_ours();
         spell::clear_personal();
+        self.forget_chat(cx);
         cx.set_global(crate::ai::AiConfig::default());
         crate::storage::set_active(None);
         self.storage.clone()
     }
 
-    /// Saves everything synchronously; used when the app is quitting.
-    pub fn flush_blocking(&mut self, cx: &mut Context<Self>) {
+    /// Saves everything synchronously; used when the app is quitting. Returns whether every
+    /// change reached the disk.
+    pub fn flush_blocking(&mut self, cx: &mut Context<Self>) -> bool {
+        let failed = self.storage.failed_saves();
         self.autosave(true, cx);
-        self.save_session(cx);
+        self.save_session(true, cx);
         crate::clipboard::clear_ours();
-        if !self.storage.wait_idle_blocking(Duration::from_secs(5)) {
+        let idle = self.storage.wait_idle_blocking(FLUSH_TIMEOUT);
+        if !idle {
             tracing::error!("pending saves did not finish before exit");
         }
+        idle && self.storage.failed_saves() == failed
+    }
+
+    /// Tells the user that closing was held back because something is not saved.
+    pub fn report_unsaved_at_close(&mut self, cx: &mut Context<Self>) {
+        self.storage.resume();
+        self.save_error = Some(
+            "Some changes could not be saved (the disk may be full, or another program is \
+             using the vault), so Inkveil stayed open. Copy what you need somewhere safe, or \
+             try again in a moment. Closing again quits anyway."
+                .into(),
+        );
+        cx.notify();
     }
 
     // ----- Actions -----------------------------------------------------------------------------
@@ -805,6 +1098,8 @@ impl Workspace {
 
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.search.focus_handle(cx), cx);
+        // What was searched for last is selected, so typing starts a new search.
+        self.search.update(cx, TextField::select_everything);
     }
 
     fn on_lock(&mut self, _: &LockVault, window: &mut Window, cx: &mut Context<Self>) {
@@ -819,79 +1114,6 @@ impl Workspace {
     }
 
     // ----- Rendering ---------------------------------------------------------------------------
-
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = theme(cx);
-        div()
-            .id("tabs")
-            .flex()
-            .h(px(36.))
-            .flex_none()
-            .bg(colors.surface)
-            .border_b_1()
-            .border_color(colors.border)
-            .overflow_x_scroll()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.touch()))
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                let note = tab.read(cx);
-                let active = self.active == Some(index);
-                let title = note.display_title();
-                div()
-                    .id(("tab", index))
-                    .group("tab")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .max_w(px(220.))
-                    .h_full()
-                    .flex_none()
-                    .border_r_1()
-                    .border_color(colors.border)
-                    .cursor_pointer()
-                    .text_size(px(13.))
-                    .when(active, |d| d.bg(colors.background).text_color(colors.text))
-                    .when(!active, |d| {
-                        d.text_color(colors.muted).hover(|d| d.bg(colors.hover))
-                    })
-                    .child(icon(Icon::FileText, colors.muted).size(px(14.)))
-                    .child(div().truncate().child(title))
-                    .child(
-                        div()
-                            .id(("close", index))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(20.))
-                            .rounded_sm()
-                            .when(!active, |d| {
-                                d.invisible().group_hover("tab", gpui::Styled::visible)
-                            })
-                            .hover(|d| d.bg(colors.hover))
-                            .child(icon(Icon::X, colors.muted).size(px(13.)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(index, window, cx);
-                            })),
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
-                    )
-                    .on_mouse_down(
-                        gpui::MouseButton::Middle,
-                        cx.listener(move |this, _, window, cx| this.close_tab(index, window, cx)),
-                    )
-            }))
-            .child(
-                div()
-                    .id("tabs-empty")
-                    .flex_1()
-                    .min_w(px(48.))
-                    .h_full()
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::double_click_new_note)),
-            )
-    }
 
     fn double_click_new_note(
         &mut self,
@@ -940,6 +1162,7 @@ impl Workspace {
         let current = self.settings.auto_lock;
         let mut panel = div()
             .id("settings-menu")
+            .debug_selector(|| "settings-menu".to_owned())
             .occlude()
             .flex()
             .flex_col()
@@ -952,8 +1175,10 @@ impl Workspace {
             .shadow_md()
             .text_size(px(13.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.show_settings = false;
-                cx.notify();
+                if !this.press_on_settings {
+                    this.show_settings = false;
+                    cx.notify();
+                }
             }))
             .child(heading("LOCK AUTOMATICALLY AFTER NO ACTIVITY"));
         for choice in AutoLock::CHOICES {
@@ -1128,9 +1353,13 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_between()
+            .gap_3()
             .h(px(26.))
             .px_3()
             .flex_none()
+            // In a narrow window the left side is cut short; nothing wraps or overlaps.
+            .overflow_hidden()
+            .whitespace_nowrap()
             .bg(colors.surface)
             .border_t_1()
             .border_color(colors.border)
@@ -1141,6 +1370,8 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(
                         div()
                             .id("lock")
@@ -1158,6 +1389,9 @@ impl Workspace {
                             .relative()
                             .child(
                                 status_item("settings")
+                                    .capture_any_mouse_down(cx.listener(|this, _, _, _| {
+                                        this.press_on_settings = true;
+                                    }))
                                     .when(show_settings && !self.settings_from_sidebar, |d| {
                                         d.bg(colors.hover)
                                     })
@@ -1198,6 +1432,7 @@ impl Workspace {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap_2()
                     .children(line_col.map(|(l, c)| format!("Ln {l}, Col {c}")))
@@ -1253,11 +1488,12 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx);
-        let main: gpui::AnyElement = match self.active {
-            Some(a) => self.tabs[a].clone().into_any_element(),
-            None => div()
+        let main: gpui::AnyElement = match (self.render_notes(cx), self.chat.clone()) {
+            (Some(notes), _) => notes,
+            (None, Some(chat)) if self.chat_alone => chat.into_any_element(),
+            (None, _) => div()
                 .size_full()
                 .flex()
                 .flex_col()
@@ -1272,6 +1508,7 @@ impl Render for Workspace {
                         .opacity(0.85),
                 )
                 .child("Select a note, or press Ctrl+N to start a new one.")
+                .child("Press Ctrl+J to chat with Grok.")
                 .into_any_element(),
         };
         div()
@@ -1280,12 +1517,25 @@ impl Render for Workspace {
             .flex_col()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
+            // Runs before the listeners of anything inside: each press starts afresh.
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.press_on_settings = false))
             .on_action(cx.listener(Self::on_new_note))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, window, cx| {
+                this.reopen_closed_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                this.toggle_split(window, cx);
+            }))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(|this, _: &SaveNow, _, cx| this.autosave(true, cx)))
             .on_action(cx.listener(Self::on_lock))
+            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| {
+                let tab = this.active.map(|active| this.tabs[active].clone());
+                this.toggle_chat(tab, window, cx);
+            }))
             .on_action(cx.listener(Self::on_trash))
             .on_action(cx.listener(|this, _: &ToggleWrap, _, cx| {
                 this.update_settings(cx, |s| s.editor.wrap = !s.editor.wrap);
@@ -1340,6 +1590,7 @@ impl Render for Workspace {
                     ),
             )
             .child(self.render_status(cx))
+            .children(self.render_tab_menu(window, cx))
             .children(self.render_recovery_key_dialog(cx))
             .children(self.render_ai_dialog(cx))
     }

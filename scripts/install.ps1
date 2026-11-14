@@ -8,7 +8,8 @@
 # Notes are never touched: they live in %LOCALAPPDATA%\Inkveil\vault, apart from the program, and
 # this script only ever reads that folder. Before replacing the program it closes Inkveil (which
 # saves every note) and copies the whole vault to %LOCALAPPDATA%\Inkveil\update-backups, checking
-# the copy; if that fails, nothing is installed. See "Your notes and keys" in README.md.
+# the copy; if that fails, nothing is installed. Afterwards it checks that every vault file is
+# still byte for byte what it was. See "Your notes and keys" in README.md.
 param([switch]$NoBuild, [switch]$Uninstall, [switch]$NoDesktopShortcut)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -22,6 +23,26 @@ $vaultDir = Join-Path $env:LOCALAPPDATA "Inkveil\vault"
 $updateBackups = Join-Path $env:LOCALAPPDATA "Inkveil\update-backups"
 # Pre-update copies kept; older ones made by this script are removed.
 $keepBackups = 5
+
+function Show-NotesWarning {
+    Write-Host ""
+    Write-Host "  ============================ IMPORTANT ============================" -ForegroundColor Yellow
+    Write-Host "  YOUR NOTES MUST NOT BE TOUCHED BY THIS UPDATE." -ForegroundColor Yellow
+    Write-Host "  Only the program in $installDir is replaced." -ForegroundColor Yellow
+    Write-Host "  The vault in $vaultDir is only read." -ForegroundColor Yellow
+    Write-Host "  Do not delete, move or edit anything in that folder by hand." -ForegroundColor Yellow
+    Write-Host "  ===================================================================" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+function Get-VaultFingerprint {
+    # Name, size and hash of every vault file. Only reads.
+    if (-not (Test-Path $vaultDir)) { return "" }
+    $lines = Get-ChildItem $vaultDir -Recurse -File | Sort-Object FullName | ForEach-Object {
+        "{0}|{1}|{2}" -f $_.FullName, $_.Length, (Get-FileHash $_.FullName).Hash
+    }
+    return $lines -join "`n"
+}
 
 function Close-RunningInkveil {
     # Close windows politely so every note is saved, then wait for the process to exit.
@@ -77,8 +98,10 @@ if (-not $NoBuild) {
 $built = Join-Path $root "target\release\inkveil.exe"
 if (-not (Test-Path $built)) { throw "no release build at $built" }
 
+Show-NotesWarning
 Close-RunningInkveil
 Backup-Vault
+$vaultBefore = Get-VaultFingerprint
 New-Item -ItemType Directory -Force $installDir | Out-Null
 Copy-Item $built $installedExe -Force
 
@@ -94,5 +117,10 @@ foreach ($path in $links) {
     $link.Save()
 }
 
+if ((Get-VaultFingerprint) -ne $vaultBefore) {
+    throw "The vault in $vaultDir changed during the update. Do not open Inkveil; the copy made " +
+        "before the update is in $updateBackups."
+}
+Write-Host "Checked: every file in the vault is unchanged." -ForegroundColor Green
 Write-Host "Installed $installedExe"
 Write-Host "Open it from the Start menu or the desktop shortcut (search for Inkveil)."

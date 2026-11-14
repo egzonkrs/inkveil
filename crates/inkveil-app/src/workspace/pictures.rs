@@ -19,6 +19,62 @@ use crate::{
     ui::{button, icon_button},
 };
 
+/// Reads a picture file, or says why it cannot be inserted.
+fn read_picture_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let is_picture = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| images::EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if !is_picture {
+        return Err(format!(
+            "{} is not a picture Inkveil can insert.",
+            path.display()
+        ));
+    }
+    let unreadable = |error| format!("Could not open the file: {error}");
+    if std::fs::metadata(path).map_err(unreadable)?.len() > images::MAX_INPUT_BYTES as u64 {
+        return Err("That picture is larger than 50 MB.".into());
+    }
+    std::fs::read(path).map_err(unreadable)
+}
+
+/// Cleans up `bytes`, stores them encrypted and inserts the picture at the caret of `note`.
+async fn store_and_insert(
+    note: &gpui::WeakEntity<NoteEditor>,
+    storage: &crate::storage::Storage,
+    bytes: Vec<u8>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let prepared = cx
+        .background_executor()
+        .spawn(async move { images::prepare(&bytes) })
+        .await;
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(error) => {
+            note.update(cx, |this, cx| this.report(error, cx)).ok();
+            return;
+        }
+    };
+    let (width, height) = (prepared.width, prepared.height);
+    let stored = storage.put_blob(prepared.bytes).await;
+    note.update(cx, |this, cx| match stored {
+        Ok(id) => {
+            let image = ImageBlock {
+                blob: id.0,
+                pixel_width: width,
+                pixel_height: height,
+                width_percent: images::DEFAULT_WIDTH_PERCENT,
+                align: Align::Left,
+            };
+            this.editor
+                .update(cx, |e, cx| e.run(cx, |ed| ed.insert_image(image)));
+        }
+        Err(error) => this.report(format!("Could not store the picture: {error}"), cx),
+    })
+    .ok();
+}
+
 /// A picture shown large over a blurred, dimmed backdrop.
 pub struct Zoom {
     blob: BlobId,
@@ -60,34 +116,7 @@ impl NoteEditor {
     pub fn insert_picture(&mut self, bytes: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) {
         let storage = self.storage.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let prepared = cx
-                .background_executor()
-                .spawn(async move { images::prepare(&bytes) })
-                .await;
-            let prepared = match prepared {
-                Ok(p) => p,
-                Err(error) => {
-                    this.update(cx, |this, cx| this.report(error, cx)).ok();
-                    return;
-                }
-            };
-            let (width, height) = (prepared.width, prepared.height);
-            let stored = storage.put_blob(prepared.bytes).await;
-            this.update(cx, |this, cx| match stored {
-                Ok(id) => {
-                    let image = ImageBlock {
-                        blob: id.0,
-                        pixel_width: width,
-                        pixel_height: height,
-                        width_percent: images::DEFAULT_WIDTH_PERCENT,
-                        align: Align::Left,
-                    };
-                    this.editor
-                        .update(cx, |e, cx| e.run(cx, |ed| ed.insert_image(image)));
-                }
-                Err(error) => this.report(format!("Could not store the picture: {error}"), cx),
-            })
-            .ok();
+            store_and_insert(&this, &storage, bytes, cx).await;
         })
         .detach();
     }
@@ -99,29 +128,24 @@ impl NoteEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for path in paths {
-            let is_picture = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| images::EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
-            if !is_picture {
-                self.report(
-                    format!("{} is not a picture Inkveil can insert.", path.display()),
-                    cx,
-                );
-                continue;
-            }
-            match std::fs::metadata(&path) {
-                Ok(m) if m.len() > images::MAX_INPUT_BYTES as u64 => {
-                    self.report("That picture is larger than 50 MB.".into(), cx);
+        let storage = self.storage.clone();
+        // One after the other, in the order given, and off the UI thread: a pile of photos
+        // read and decoded all at once can need gigabytes and freezes the window meanwhile.
+        cx.spawn_in(window, async move |this, cx| {
+            for path in paths {
+                let read = cx
+                    .background_executor()
+                    .spawn(async move { read_picture_file(&path) })
+                    .await;
+                match read {
+                    Ok(bytes) => store_and_insert(&this, &storage, bytes, cx).await,
+                    Err(problem) => {
+                        this.update(cx, |this, cx| this.report(problem, cx)).ok();
+                    }
                 }
-                Ok(_) => match std::fs::read(&path) {
-                    Ok(bytes) => self.insert_picture(bytes, window, cx),
-                    Err(error) => self.report(format!("Could not open the file: {error}"), cx),
-                },
-                Err(error) => self.report(format!("Could not open the file: {error}"), cx),
             }
-        }
+        })
+        .detach();
     }
 
     /// Asks for picture files and inserts them.
@@ -181,8 +205,20 @@ impl NoteEditor {
         }
         let storage = self.storage.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(bytes) = storage.load_blob(blob).await else {
-                return;
+            let bytes = match storage.load_blob(blob).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // Not left on "Opening…" for ever.
+                    this.update(cx, |this, cx| {
+                        if this.zoom.as_ref().is_some_and(|z| z.blob == blob) {
+                            this.zoom = None;
+                        }
+                        this.report(format!("Could not open the picture: {error}"), cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
             };
             let (need_image, need_backdrop) = (image.is_none(), backdrop.is_none());
             let decoded = cx

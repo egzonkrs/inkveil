@@ -35,7 +35,8 @@ const MIN_COL_WIDTH: f32 = 60.;
 /// Inputs that change how text looks, beyond the document itself.
 #[derive(Clone, PartialEq)]
 pub struct Decorations {
-    /// Misspelled ranges per location, painted with a wavy underline.
+    /// Misspelled ranges per location, painted with a wavy underline. In the order of the
+    /// blocks, so the ranges of one block can be found without reading them all.
     pub spelling: Vec<(Loc, Range<usize>)>,
     /// The IME composition range, underlined.
     pub marked: Option<(Loc, Range<usize>)>,
@@ -372,9 +373,12 @@ fn text_runs(
     decorations: &Decorations,
     theme: &Theme,
 ) -> Vec<TextRun> {
-    let spelling: Vec<&Range<usize>> = decorations
+    let first = decorations
         .spelling
+        .partition_point(|(l, _)| l.block < loc.block);
+    let spelling: Vec<&Range<usize>> = decorations.spelling[first..]
         .iter()
+        .take_while(|(l, _)| l.block == loc.block)
         .filter(|(l, _)| *l == loc)
         .map(|(_, r)| r)
         .collect();
@@ -662,7 +666,7 @@ impl DocLayout {
         let decorated = if everything || *decorations == self.decorations {
             Vec::new()
         } else {
-            decoration_changes(&self.decorations, decorations)
+            decoration_changes(&self.decorations, decorations, &diff)
         };
         if diff.is_empty() && decorated.is_empty() {
             return;
@@ -962,15 +966,54 @@ fn layout_block(
     }
 }
 
-/// Blocks whose decorations differ between `old` and `new`.
-fn decoration_changes(old: &Decorations, new: &Decorations) -> Vec<usize> {
-    let mut blocks: Vec<usize> = old
+/// Blocks (of the new document) whose decorations differ between `old` and `new`, apart from
+/// the blocks `diff` says changed: those are laid out again anyway.
+///
+/// Blocks after the change keep their decorations but get a new number when a line is added or
+/// removed above them; they are compared at their new place, so that pressing Enter does not
+/// lay out the rest of the note again.
+fn decoration_changes(
+    old: &Decorations,
+    new: &Decorations,
+    diff: &inkveil_doc::BlockDiff,
+) -> Vec<usize> {
+    use std::collections::HashSet;
+
+    let moved = |loc: &Loc| {
+        if loc.block < diff.start {
+            Some(*loc)
+        } else if loc.block >= diff.old_end {
+            Some(Loc {
+                block: loc.block - diff.old_end + diff.new_end,
+                ..*loc
+            })
+        } else {
+            None
+        }
+    };
+    let before: HashSet<(Loc, Range<usize>)> = old
         .spelling
         .iter()
-        .filter(|d| !new.spelling.contains(d))
-        .chain(new.spelling.iter().filter(|d| !old.spelling.contains(d)))
-        .map(|(loc, _)| loc.block)
+        .filter_map(|(loc, range)| Some((moved(loc)?, range.clone())))
         .collect();
+    let mut blocks = Vec::new();
+    let mut after = HashSet::with_capacity(new.spelling.len());
+    for (loc, range) in &new.spelling {
+        if (diff.start..diff.new_end).contains(&loc.block) {
+            continue;
+        }
+        let underline = (*loc, range.clone());
+        if !before.contains(&underline) {
+            blocks.push(loc.block);
+        }
+        after.insert(underline);
+    }
+    blocks.extend(
+        before
+            .iter()
+            .filter(|underline| !after.contains(underline))
+            .map(|(loc, _)| loc.block),
+    );
     if old.marked != new.marked {
         blocks.extend(
             old.marked
@@ -1012,4 +1055,55 @@ fn list_numbers(doc: &Document) -> Vec<Option<String>> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use inkveil_doc::BlockDiff;
+
+    use super::*;
+
+    fn underlines(blocks: &[usize]) -> Decorations {
+        Decorations {
+            spelling: blocks
+                .iter()
+                .map(|&block| (Loc { block, cell: None }, 0..4))
+                .collect(),
+            marked: None,
+        }
+    }
+
+    #[test]
+    fn a_new_line_does_not_touch_the_underlines_below_it() {
+        // Enter in block 1 of a note with underlines in blocks 0, 3 and 7: the blocks below
+        // move down by one and keep their underlines.
+        let diff = BlockDiff {
+            start: 1,
+            old_end: 2,
+            new_end: 3,
+        };
+        let changed = decoration_changes(&underlines(&[0, 3, 7]), &underlines(&[0, 4, 8]), &diff);
+        assert_eq!(changed, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn only_blocks_whose_underlines_changed_are_laid_out_again() {
+        let nothing = BlockDiff {
+            start: 0,
+            old_end: 0,
+            new_end: 0,
+        };
+        // The underline in block 3 went away and one appeared in block 5.
+        let changed =
+            decoration_changes(&underlines(&[0, 3, 7]), &underlines(&[0, 5, 7]), &nothing);
+        assert_eq!(changed, [3, 5]);
+        // Underlines inside the changed blocks are not reported: those are laid out anyway.
+        let diff = BlockDiff {
+            start: 2,
+            old_end: 4,
+            new_end: 4,
+        };
+        let changed = decoration_changes(&underlines(&[0, 3, 7]), &underlines(&[0, 2, 7]), &diff);
+        assert_eq!(changed, [] as [usize; 0]);
+    }
 }

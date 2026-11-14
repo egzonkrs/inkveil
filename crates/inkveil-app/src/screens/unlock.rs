@@ -122,6 +122,12 @@ impl UnlockScreen {
             .filter(|d| !d.is_zero())
     }
 
+    /// Shows a message where errors go, until the next unlock attempt.
+    pub fn show_problem(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        self.error = Some(message.into());
+        cx.notify();
+    }
+
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
         self.error = None;

@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -39,6 +39,8 @@ pub mod state_keys {
     pub const SECTIONS: &str = "sections";
     /// The folder daily backups are also copied to.
     pub const BACKUP_FOLDER: &str = "backup-folder";
+    /// When unused pictures were last looked for (Unix milliseconds, as text).
+    pub const PICTURES_TIDIED: &str = "pictures-tidied";
 }
 
 /// Left in the backup folder, so the copies can be used without this README at hand.
@@ -57,6 +59,15 @@ To restore one:
 
 /// Make a backup (at unlock, and hourly checks while unlocked) if the newest one is older than this.
 const BACKUP_EVERY_MS: i64 = 20 * 60 * 60 * 1000;
+/// Look for unused pictures at most this often: it reads every note and every saved version.
+const TIDY_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
+/// How often a note save that failed is tried again before it is reported, and the pause in
+/// between. A database that is busy for a moment (an antivirus or backup tool reading it) is
+/// usually free again right away.
+const SAVE_TRIES: u32 = 3;
+const SAVE_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// The thread the worker runs on.
+pub const THREAD_NAME: &str = "inkveil-storage";
 
 enum Job {
     SaveNote {
@@ -88,6 +99,8 @@ enum Job {
     },
     SearchBodies {
         query: String,
+        /// Which search this is: a newer one makes it stop.
+        generation: u64,
         reply: oneshot::Sender<Vec<crate::search::BodyHit>>,
     },
     ListNotes {
@@ -110,8 +123,10 @@ enum Job {
         revision: RevisionId,
         reply: oneshot::Sender<Result<Zeroizing<Vec<u8>>, StoreError>>,
     },
-    /// Integrity check plus a backup if one is due.
-    Maintenance,
+    /// Checks the structure of the database.
+    Check,
+    /// Removes pictures no note uses any more, if that was not done lately.
+    TidyPictures,
     /// Where backups are also copied from now on.
     SetBackupFolder(Option<PathBuf>),
     /// A backup if one is due, or now with `force`, copied to the backup folder.
@@ -155,6 +170,12 @@ pub struct Storage {
     jobs: mpsc::Sender<Job>,
     pending: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
+    /// The app is closing or locking: only saves matter now, housekeeping is skipped.
+    urgent: Arc<AtomicBool>,
+    /// How many note saves have failed for good.
+    failed_saves: Arc<AtomicUsize>,
+    /// The newest sidebar search; older ones stop.
+    search_generation: Arc<AtomicU64>,
     events: UnboundedSender<StorageEvent>,
 }
 
@@ -179,23 +200,42 @@ impl Storage {
         let (jobs, rx) = mpsc::channel::<Job>();
         let pending = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
+        let urgent = Arc::new(AtomicBool::new(false));
+        let failed_saves = Arc::new(AtomicUsize::new(0));
+        let search_generation = Arc::new(AtomicU64::new(0));
         let worker = Worker {
             pending: pending.clone(),
             stopped: stopped.clone(),
+            urgent: urgent.clone(),
+            failed_saves: failed_saves.clone(),
+            search_generation: search_generation.clone(),
             events: events.clone(),
             backup_folder: RefCell::new(None),
             copying: Arc::new(AtomicBool::new(false)),
         };
         thread::Builder::new()
-            .name("inkveil-storage".into())
+            .name(THREAD_NAME.into())
             .spawn(move || worker.run(vault, &rx))
             .expect("failed to start the storage thread");
         Self {
             jobs,
             pending,
             stopped,
+            urgent,
+            failed_saves,
+            search_generation,
             events,
         }
+    }
+
+    /// The app is not closing after all: housekeeping and searches run again.
+    pub fn resume(&self) {
+        self.urgent.store(false, Ordering::SeqCst);
+    }
+
+    /// How many note saves have failed for good since the vault was unlocked.
+    pub fn failed_saves(&self) -> usize {
+        self.failed_saves.load(Ordering::SeqCst)
     }
 
     fn send(&self, job: Job) {
@@ -233,8 +273,12 @@ impl Storage {
         self.send(Job::PutState { key, value });
     }
 
+    /// Checks the database, makes a backup if one is due and tidies up pictures. Separate
+    /// jobs, so that saves and opening notes get their turn in between.
     pub fn run_maintenance(&self) {
-        self.send(Job::Maintenance);
+        self.send(Job::Check);
+        self.send(Job::Backup { force: false });
+        self.send(Job::TidyPictures);
     }
 
     /// Sets the folder backups are also copied to (`None`: only the vault's own backups).
@@ -271,9 +315,17 @@ impl Storage {
     }
 
     /// Notes whose text contains `query` (ignoring case), with a snippet around the first match.
+    ///
+    /// A search that is still running when the next one is asked for stops and finds nothing:
+    /// nobody is waiting for it any more.
     pub async fn search_bodies(&self, query: String) -> Vec<crate::search::BodyHit> {
         let (reply, rx) = oneshot::channel();
-        self.send(Job::SearchBodies { query, reply });
+        let generation = self.search_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.send(Job::SearchBodies {
+            query,
+            generation,
+            reply,
+        });
         rx.await.unwrap_or_default()
     }
 
@@ -324,6 +376,7 @@ impl Storage {
     /// Writes everything pending, wipes the keys and returns the locked vault.
     pub async fn lock(self) -> Option<LockedVault> {
         let (reply, rx) = oneshot::channel();
+        self.urgent.store(true, Ordering::SeqCst);
         self.send(Job::Lock { reply });
         rx.await.ok()
     }
@@ -332,6 +385,7 @@ impl Storage {
     ///
     /// Used when the app is quitting or crashing, where nothing async can run any more.
     pub fn wait_idle_blocking(&self, timeout: Duration) -> bool {
+        self.urgent.store(true, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + timeout;
         while self.pending.load(Ordering::SeqCst) > 0 && !self.is_stopped() {
             if std::time::Instant::now() >= deadline {
@@ -350,6 +404,9 @@ fn stopped_error() -> StoreError {
 struct Worker {
     pending: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
+    urgent: Arc<AtomicBool>,
+    failed_saves: Arc<AtomicUsize>,
+    search_generation: Arc<AtomicU64>,
     events: UnboundedSender<StorageEvent>,
     backup_folder: RefCell<Option<PathBuf>>,
     /// A copy to the backup folder is running on its own thread.
@@ -395,11 +452,18 @@ impl Worker {
             };
         match job {
             Job::SaveNote { id, meta, body } => {
-                report(
-                    "saving a note",
-                    Some(id),
-                    vault.save_note(&id, &meta, &body),
-                );
+                let mut result = vault.save_note(&id, &meta, &body);
+                for _ in 1..SAVE_TRIES {
+                    if result.is_ok() {
+                        break;
+                    }
+                    thread::sleep(SAVE_RETRY_PAUSE);
+                    result = vault.save_note(&id, &meta, &body);
+                }
+                if result.is_err() {
+                    self.failed_saves.fetch_add(1, Ordering::SeqCst);
+                }
+                report("saving a note", Some(id), result);
             }
             Job::SaveMeta { id, meta } => {
                 report("saving a note", None, vault.save_meta(&id, &meta));
@@ -426,21 +490,31 @@ impl Worker {
             Job::LoadBlob { id, reply } => {
                 let _ = reply.send(vault.load_blob(id));
             }
-            Job::SearchBodies { query, reply } => {
-                let hits = vault.notes().map_or_else(
-                    |_| Vec::new(),
-                    |listing| {
-                        listing
-                            .notes
-                            .iter()
-                            .filter_map(|note| {
-                                let body = vault.load_body(&note.id).ok()?;
-                                let doc = inkveil_doc::Document::decode(&body).ok()?;
-                                crate::search::search_doc(note.id, &doc, &query)
-                            })
-                            .collect()
-                    },
-                );
+            Job::SearchBodies {
+                query,
+                generation,
+                reply,
+            } => {
+                // Dropping `reply` unanswered gives the search that asked no results.
+                let superseded = || {
+                    self.search_generation.load(Ordering::SeqCst) != generation
+                        || self.urgent.load(Ordering::SeqCst)
+                };
+                let mut hits = Vec::new();
+                for note in vault
+                    .notes()
+                    .map(|listing| listing.notes)
+                    .unwrap_or_default()
+                {
+                    if superseded() {
+                        return;
+                    }
+                    let found = vault.load_body(&note.id).ok().and_then(|body| {
+                        let doc = inkveil_doc::Document::decode(&body).ok()?;
+                        crate::search::search_doc(note.id, &doc, &query)
+                    });
+                    hits.extend(found);
+                }
                 let _ = reply.send(hits);
             }
             Job::LoadBody { id, reply } => {
@@ -459,20 +533,36 @@ impl Worker {
             } => {
                 let _ = reply.send(vault.load_revision_body(&id, revision));
             }
-            Job::Maintenance => {
-                match vault.quick_check() {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        let _ = self.events.unbounded_send(StorageEvent::IntegrityProblem);
-                    }
+            // Housekeeping is left for next time when the app is closing or locking: the
+            // saves queued behind it must not wait.
+            Job::Check | Job::TidyPictures | Job::Backup { force: false }
+                if self.urgent.load(Ordering::SeqCst) => {}
+            Job::Check => match vault.quick_check() {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    let _ = self.events.unbounded_send(StorageEvent::IntegrityProblem);
                 }
-                report(
-                    "making a backup",
-                    None,
-                    vault.backup_if_due(BACKUP_EVERY_MS).map(drop),
-                );
-                self.copy_backups(vault);
-                report("tidying up pictures", None, delete_unused_pictures(vault));
+            },
+            Job::TidyPictures => {
+                let last = vault
+                    .get_state(state_keys::PICTURES_TIDIED)
+                    .ok()
+                    .flatten()
+                    .and_then(|at| std::str::from_utf8(&at).ok()?.parse::<i64>().ok());
+                let now = now_ms();
+                // A clock that went backwards counts as due.
+                if last.is_some_and(|last| (0..TIDY_EVERY_MS).contains(&(now - last))) {
+                    return;
+                }
+                match delete_unused_pictures(vault, &self.urgent) {
+                    Ok(true) => report(
+                        "saving app state",
+                        None,
+                        vault.put_state(state_keys::PICTURES_TIDIED, now.to_string().as_bytes()),
+                    ),
+                    Ok(false) => {}
+                    Err(error) => report("tidying up pictures", None, Err(error)),
+                }
             }
             Job::SetBackupFolder(folder) => {
                 *self.backup_folder.borrow_mut() = folder;
@@ -552,7 +642,10 @@ impl Worker {
 /// Removes pictures that no note or saved version uses any more. Only pictures older than a day
 /// are considered, so one pasted moments ago is never removed before its note is saved. If any
 /// note cannot be read, nothing is removed: a picture it uses might be lost.
-fn delete_unused_pictures(vault: &Vault) -> Result<(), StoreError> {
+///
+/// Returns whether it ran to the end. It gives up, removing nothing, as soon as `urgent` is set:
+/// it reads every note and every saved version, which can take a while in a big vault.
+fn delete_unused_pictures(vault: &Vault, urgent: &AtomicBool) -> Result<bool, StoreError> {
     use std::collections::HashSet;
 
     let mut in_use: HashSet<inkveil_store::BlobId> = HashSet::new();
@@ -569,15 +662,17 @@ fn delete_unused_pictures(vault: &Vault) -> Result<(), StoreError> {
     };
     let listing = vault.notes()?;
     if !listing.unreadable.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     for note in &listing.notes {
-        if !collect(&vault.load_body(&note.id)?) {
-            return Ok(());
+        if urgent.load(Ordering::SeqCst) || !collect(&vault.load_body(&note.id)?) {
+            return Ok(false);
         }
         for revision in vault.revisions(&note.id)? {
-            if !collect(&vault.load_revision_body(&note.id, revision.id)?) {
-                return Ok(());
+            if urgent.load(Ordering::SeqCst)
+                || !collect(&vault.load_revision_body(&note.id, revision.id)?)
+            {
+                return Ok(false);
             }
         }
     }
@@ -585,7 +680,7 @@ fn delete_unused_pictures(vault: &Vault) -> Result<(), StoreError> {
     if removed > 0 {
         tracing::info!("removed {removed} unused picture(s)");
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -597,6 +692,35 @@ mod tests {
     use inkveil_store::VaultPaths;
 
     use super::*;
+
+    #[test]
+    fn closing_skips_housekeeping_but_never_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::new(dir.path().join("vault"));
+        let vault =
+            Vault::create(paths, &Password::new("correct horse 7"), KdfParams::TESTING).unwrap();
+        let (events, mut rx) = futures::channel::mpsc::unbounded();
+        let storage = Storage::start(vault, events);
+        // The app starts to close: from here on only saves matter.
+        assert!(storage.wait_idle_blocking(Duration::from_secs(5)));
+        storage.run_maintenance();
+        let id = NoteId::generate().unwrap();
+        let body = Zeroizing::new(inkveil_doc::Document::new().encode().to_vec());
+        storage.save_note(id, NoteMeta::new("kept"), body);
+        assert!(storage.wait_idle_blocking(Duration::from_secs(5)));
+        assert_eq!(storage.failed_saves(), 0);
+
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            matches!(seen.as_slice(), [StorageEvent::NoteSaved(saved)] if *saved == id),
+            "only the save ran: {seen:?}"
+        );
+        let listing = futures::executor::block_on(storage.list_notes()).unwrap();
+        assert_eq!(listing.notes.len(), 1);
+    }
 
     #[test]
     fn backups_are_copied_to_the_chosen_folder() {

@@ -25,6 +25,9 @@ use crate::{
 
 /// Notes shown per group before "Show more".
 const GROUP_PREVIEW: usize = 10;
+/// How many search results or trashed notes are listed before "Show more". Every row on the
+/// list is built and laid out on each frame, also while typing in a note.
+const FLAT_PREVIEW: usize = 60;
 
 /// What the inline section name field is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +45,10 @@ pub struct SidebarState {
     pub section_field: Option<(SectionEdit, Entity<TextField>)>,
     pub note_menu: Option<(NoteId, Point<Pixels>)>,
     pub section_menu: Option<(SectionId, Point<Pixels>)>,
+    /// The search results or the trash show every note, not just the first ones.
+    pub show_all: bool,
+    /// How far the note list is scrolled, and its scrollbar.
+    pub scroll: crate::ui::scrollbar::Scrollbar,
 }
 
 impl Workspace {
@@ -83,7 +90,10 @@ impl Workspace {
             |this, field, event, window, cx| match event {
                 TextFieldEvent::Submitted | TextFieldEvent::Blurred => {
                     let name = field.read(cx).text().trim().to_owned();
-                    this.finish_section_edit(&name, window, cx);
+                    // Leaving the field by clicking elsewhere keeps the keyboard where the
+                    // click put it.
+                    let refocus = *event == TextFieldEvent::Submitted;
+                    this.finish_section_edit(&name, refocus, window, cx);
                 }
                 TextFieldEvent::Changed => {}
             },
@@ -94,7 +104,13 @@ impl Workspace {
         cx.notify();
     }
 
-    fn finish_section_edit(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn finish_section_edit(
+        &mut self,
+        name: &str,
+        refocus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((edit, _)) = self.sidebar.section_field.take() else {
             return;
         };
@@ -113,7 +129,9 @@ impl Workspace {
             }
             self.save_sections();
         }
-        window.focus(&self.focus_handle, cx);
+        if refocus {
+            self.focus_main(window, cx);
+        }
         cx.notify();
     }
 
@@ -186,6 +204,27 @@ impl Workspace {
                 .any(|t| t.to_lowercase().contains(query))
     }
 
+    /// Opens a note from the list; one found by its text opens with that text found in it.
+    fn open_from_list(&mut self, id: NoteId, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).text().trim().to_owned();
+        if self.body_hits.contains_key(&id) && !query.is_empty() {
+            self.open_note_and_find(id, query, window, cx);
+        } else {
+            self.open_note(id, None, true, window, cx);
+        }
+    }
+
+    /// Enter in the search field: opens the first note it found.
+    pub(super) fn open_first_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.query(cx);
+        if query.is_empty() || self.show_trash {
+            return;
+        }
+        if let Some(id) = self.listed(&query).first().map(|note| note.id) {
+            self.open_from_list(id, window, cx);
+        }
+    }
+
     /// Notes in the trash or not, filtered by the search query, pinned first then newest.
     fn listed(&self, query: &str) -> Vec<&NoteSummary> {
         let mut notes: Vec<&NoteSummary> = self
@@ -218,8 +257,33 @@ impl Workspace {
         let mut list: Vec<AnyElement> = Vec::new();
         if self.show_trash || !query.is_empty() {
             // Flat list: trash, or search results across all sections.
-            for note in &notes {
+            let shown = if self.sidebar.show_all {
+                notes.len()
+            } else {
+                notes.len().min(FLAT_PREVIEW)
+            };
+            for note in &notes[..shown] {
                 list.push(self.note_row(note, now, cx));
+            }
+            if notes.len() > shown {
+                list.push(
+                    div()
+                        .id("more-results")
+                        .mx_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(colors.muted)
+                        .hover(|d| d.bg(colors.hover).text_color(colors.text))
+                        .child(format!("Show {} more", notes.len() - shown))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar.show_all = true;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
             }
         } else {
             if let Some((SectionEdit::New, field)) = &self.sidebar.section_field {
@@ -313,36 +377,44 @@ impl Workspace {
             .child(div().px_2().pb_2().child(self.search.clone()))
             .child(
                 div()
-                    .id("note-list")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .pb_2()
-                    .children(list)
-                    .children(empty_message.map(|text| {
+                    .child(
                         div()
-                            .px_3()
-                            .py_2()
-                            .text_size(px(12.))
-                            .text_color(colors.muted)
-                            .child(text)
-                    }))
-                    // Double-click empty space to start a note, like the tab strip.
-                    .when(!self.show_trash, |d| {
-                        d.child(
-                            div()
-                                .id("note-list-empty")
-                                .flex_1()
-                                .min_h(px(48.))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::double_click_new_note),
-                                ),
-                        )
-                    }),
+                            .id("note-list")
+                            .debug_selector(|| "note-list".to_owned())
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(self.sidebar.scroll.handle())
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .pb_2()
+                            .children(list)
+                            .children(empty_message.map(|text| {
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_size(px(12.))
+                                    .text_color(colors.muted)
+                                    .child(text)
+                            }))
+                            // Double-click empty space to start a note, like the tab strip.
+                            .when(!self.show_trash, |d| {
+                                d.child(
+                                    div()
+                                        .id("note-list-empty")
+                                        .flex_1()
+                                        .min_h(px(48.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::double_click_new_note),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(self.sidebar.scroll.render(cx)),
             )
             .child(
                 div()
@@ -361,6 +433,10 @@ impl Workspace {
                                 "Settings (auto-lock, AI key, editor)",
                                 cx,
                             )
+                            .debug_selector(|| "open-settings".to_owned())
+                            .capture_any_mouse_down(cx.listener(|this, _, _, _| {
+                                this.press_on_settings = true;
+                            }))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_settings =
                                     !this.show_settings || !this.settings_from_sidebar;
@@ -420,6 +496,7 @@ impl Workspace {
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 this.show_trash = !this.show_trash;
+                this.sidebar.show_all = false;
                 cx.notify();
             }))
     }
@@ -687,12 +764,7 @@ impl Workspace {
             .into_any_element()
         } else {
             row.on_click(cx.listener(move |this, _, window, cx| {
-                let query = this.search.read(cx).text().trim().to_owned();
-                if this.body_hits.contains_key(&id) && !query.is_empty() {
-                    this.open_note_and_find(id, query, window, cx);
-                } else {
-                    this.open_note(id, None, true, window, cx);
-                }
+                this.open_from_list(id, window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -770,6 +842,13 @@ impl Workspace {
                         this.open_note(id, None, true, window, cx);
                     }),
                 ),
+            )
+            .child(
+                Self::menu_item("menu-split", "Open in split view", Some(Icon::Columns), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.sidebar.note_menu = None;
+                        this.open_in_split(id, window, cx);
+                    })),
             )
             .child(
                 Self::menu_item(

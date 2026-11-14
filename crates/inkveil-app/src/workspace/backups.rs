@@ -177,11 +177,22 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(super) fn open_backup_folder(&self, cx: &mut Context<Self>) {
-        if let Some(folder) = &self.backups.folder
-            && folder.is_dir()
-        {
+    pub(super) fn open_backup_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = &self.backups.folder else {
+            return;
+        };
+        if folder.is_dir() {
             cx.open_with_system(folder);
+        } else {
+            // Say why nothing opened: usually a drive that is not plugged in.
+            self.backups.copy_error = Some(
+                format!(
+                    "{} cannot be found. Is its drive connected?",
+                    folder.display()
+                )
+                .into(),
+            );
+            cx.notify();
         }
     }
 

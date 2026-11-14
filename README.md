@@ -27,6 +27,13 @@ There is no web view and no JavaScript.
 - Edits are saved within about a second, in one SQLite transaction, and "Saved" only shows once
   the write is confirmed. A crash or power cut does not corrupt notes, and reopening brings back
   your tabs and cursor.
+- Tabs work like in a browser. Drag a tab to reorder it, and right-click one to pin it, duplicate
+  the note, close other tabs or reopen a closed one.
+- Split view shows two notes at once. Drag a tab onto the left or right half of the editor, or
+  right-click a tab and choose **Split view with**. Right-click either tab of a split for
+  **Arrange split view**: unsplit, close one side, show stacked or side by side, swap. Drag the bar
+  between the notes to resize them; double-click it for equal halves. Your arrangement comes back
+  after unlocking.
 - Earlier versions of each note are kept, every few minutes while you edit and thinned to one a
   day later on. The clock icon lets you preview an old version and restore it (Ctrl+Z undoes the
   restore).
@@ -93,8 +100,11 @@ vault. In the AI settings you pick a model from the list or type any OpenRouter 
 choose how long the model reasons before answering. The efforts on offer depend on the model.
 
 Only the selected text is sent, and only after a check for keys, passwords and other secrets in
-it. Requests ask OpenRouter to route only to providers that do not store or train on prompts.
+it. Every request requires zero data retention: OpenRouter refuses it rather than send it to an
+endpoint that stores prompts or trains on them, so a model with no such endpoint gives an error.
 After that, the text is covered by OpenRouter's and the model provider's policies, not Inkveil's.
+Your OpenRouter account has its own Input & output logging setting, which stores prompts in your
+logs whatever Inkveil asks; keep it off in the workspace's Observability settings.
 
 While the model works, a progress bar shows whether it is waiting, thinking or writing, along
 with the seconds so far and a Stop button. If the model goes silent for a minute, the connection
@@ -104,6 +114,36 @@ a Try again button. Each attempt gets 3 minutes, 5 at High and 10 at Extra high 
 
 Humanize changes wording, not facts. It cannot remove a statistical watermark that a provider
 might build into its choice of words.
+
+## Chat (optional)
+
+Click Chat at the right end of the toolbar, or press Ctrl+J, to ask Grok 4.7 a quick question. The
+chat fills the note's editor; click Chat again or press Escape to go back to the note. One
+conversation follows you between notes. It always uses Grok, whatever model the AI settings pick,
+with the same OpenRouter key.
+
+Choose how long Grok thinks with Low, Medium, High or Extra high below the question. Higher takes
+longer and costs more. Each reply shows how long Grok thought (from sending the question to the
+first word, so it includes the network) and how long the whole reply took.
+
+Only what you type is sent, nothing from your notes unless you paste it, with the same secret
+check and zero data retention as Improve and Humanize. The conversation is kept only in memory, never in the vault
+or on disk, and is wiped when the vault locks or Inkveil closes. Up to about 24,000 characters of
+the conversation go with each question, so Grok can follow it; older messages are left out. Grok
+only knows what is in this conversation, not earlier chats, and it does not search the web.
+
+The question field wraps as you type and grows to eight lines before it scrolls. Enter sends;
+Shift+Enter starts a new line, and pasted text keeps its lines.
+
+Drag to select text in questions and replies, even across messages. Double-click selects a word,
+triple-click a whole block, Ctrl+A everything, and Ctrl+C copies. After selecting you can just
+keep typing your next question.
+
+The panel on the right shows what each request cost and the total for this chat and since you
+unlocked, as reported by OpenRouter; the $ button hides it. Each question sends the conversation
+again, so long chats cost more per question; New chat starts cheap again. A stopped request is
+still billed, but its cost is not reported, so it shows as unknown. These figures are kept in
+memory like the chat.
 
 ## Installing
 
@@ -150,6 +190,8 @@ cargo test --workspace
 |---|---|
 | New note | Ctrl+N, or double-click empty space in the tab bar or note list |
 | Close tab / next / previous | Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab |
+| Reopen closed tab | Ctrl+Shift+T |
+| Split view on / off | Ctrl+Shift+S |
 | Search all notes | Ctrl+P or Ctrl+Shift+F |
 | Find / replace in the note | Ctrl+F / Ctrl+H (Enter / Shift+Enter: next / previous, F3) |
 | Duplicate line | Ctrl+D or Shift+Alt+Down |
@@ -159,13 +201,23 @@ cargo test --workspace
 | Back to one caret | Escape |
 | Autoscroll, like in a browser | Click the mouse wheel and move; click again or Escape to stop |
 | Lock now | Ctrl+L |
+| Chat with Grok / back to the note | Ctrl+J / Escape |
+| Send a chat question / new line in it | Enter / Shift+Enter |
+| Close a menu, popup or the AI settings | Escape |
 | Bold, italic, underline, strikethrough, code | Ctrl+B, Ctrl+I, Ctrl+U, Ctrl+Shift+X, Ctrl+E |
 | Link | Ctrl+K |
 | Heading 1, 2, 3 / paragraph | Ctrl+Alt+1, 2, 3 / Ctrl+Alt+0 |
 | Lists while typing | `- `, `1. `, `[] `, `# `, `> ` at the start of a line |
 | Indent / outdent | Tab / Shift+Tab (in tables: next / previous cell) |
 | Word wrap / line numbers | Alt+Z / Alt+N |
-| Undo / redo | Ctrl+Z / Ctrl+Y |
+| Undo / redo | Ctrl+Z / Ctrl+Y (also in the title, search and other fields) |
+| Save now | Ctrl+S (notes also save by themselves as you type) |
+| A page up / down | Page Up / Page Down (with Shift: select) |
+| Open the first search result | Enter in the search field |
+
+Right-click in any text field (title, tags, search, chat question) for Cut, Copy, Paste and
+Select all. Double-click selects a word and triple-click the line. Inkveil opens the way you
+closed it: maximized, or at the size you left it.
 
 Right-click in a note for spelling suggestions, the clipboard, the AI rewrites, and table rows
 and columns.

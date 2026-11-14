@@ -300,6 +300,7 @@ impl Editor {
                 (Pos { offset: a, ..caret }, Pos { offset: b, ..caret })
             })
             .collect();
+        let edits = without_overlaps(edits);
         let grouping = if all.iter().all(Selection::is_collapsed) {
             Grouping::Typing
         } else {
@@ -311,7 +312,8 @@ impl Editor {
         });
     }
 
-    /// Applies `edit` to each `(start, end)` range (each inside one text) as one undo step.
+    /// Applies `edit` to each `(start, end)` range (each inside one text) as one undo step. The
+    /// ranges must not overlap: see [`without_overlaps`].
     /// `edit` changes the text and returns where the caret goes. The first range belongs to the
     /// primary selection.
     fn apply_at_carets(
@@ -386,4 +388,23 @@ impl Editor {
             };
         });
     }
+}
+
+/// Clips ranges that overlap in one text, so that nothing is deleted twice. Two carets in one
+/// word both reach back to its start with Ctrl+Backspace; deleting both ranges as they are
+/// would run past the end of the text that is left. The ranges keep their order.
+fn without_overlaps(mut edits: Vec<(Pos, Pos)>) -> Vec<(Pos, Pos)> {
+    let mut order: Vec<usize> = (0..edits.len()).collect();
+    order.sort_by_key(|&i| edits[i]);
+    // How far the ranges before this one reach.
+    let mut reach: Option<Pos> = None;
+    for i in order {
+        let (start, end) = &mut edits[i];
+        if let Some(reach) = reach.filter(|reach| reach.loc == start.loc) {
+            start.offset = start.offset.max(reach.offset);
+            end.offset = end.offset.max(start.offset);
+        }
+        reach = Some(*end);
+    }
+    edits
 }

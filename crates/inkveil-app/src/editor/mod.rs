@@ -61,6 +61,8 @@ pub enum EditorEvent {
     },
     /// Pictures from the clipboard (encoded bytes) to insert at the caret.
     PasteImage(Vec<u8>),
+    /// Something the user should be told, such as a copy that did not reach the clipboard.
+    Problem(&'static str),
 }
 
 /// A misspelled word under the mouse, for the context menu.
@@ -217,6 +219,9 @@ pub struct EditorView {
     find_current: Option<usize>,
     /// The picture under the pointer, which shows its outline and resize handle.
     hovered_image: Option<usize>,
+    blink: crate::ui::blink::Blink,
+    /// The text version and selection the caret was last drawn for: a change shows it solid.
+    blink_for: Option<(u64, inkveil_doc::Selection)>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -225,7 +230,9 @@ impl EditorView {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
         Self {
             editor: Editor::new(doc),
-            focus_handle: cx.focus_handle(),
+            // A tab stop, so Tab from the title and tags reaches the text. Inside the text Tab
+            // indents.
+            focus_handle: cx.focus_handle().tab_stop(true),
             scroll: ScrollHandle::new(),
             layout: DocLayout::empty(),
             bounds: None,
@@ -247,6 +254,8 @@ impl EditorView {
             find_matches: Vec::new(),
             find_current: None,
             hovered_image: None,
+            blink: crate::ui::blink::Blink::new(),
+            blink_for: None,
         }
     }
 
@@ -256,6 +265,11 @@ impl EditorView {
 
     pub fn doc(&self) -> &Document {
         self.editor.doc()
+    }
+
+    /// Whether the caret is in the "on" half of its blink.
+    pub(super) fn caret_visible(&self) -> bool {
+        self.blink.visible()
     }
 
     fn decorations(&self, spellcheck: bool) -> Decorations {
@@ -781,17 +795,62 @@ impl EditorView {
         self.vertical(1., true, cx);
     }
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.page_rows();
-        self.vertical(-rows, false, cx);
+        self.page(false, false, cx);
     }
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.page(true, false, cx);
+    }
+    fn select_page_up(
+        &mut self,
+        _: &actions::SelectPageUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page(false, true, cx);
+    }
+    fn select_page_down(
+        &mut self,
+        _: &actions::SelectPageDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page(true, true, cx);
+    }
+
+    /// Moves the view and the caret by one page, so the caret stays on the same row of the
+    /// screen: the text moves, as Page Up and Page Down do everywhere.
+    fn page(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
         let rows = self.page_rows();
-        self.vertical(rows, false, cx);
+        let view = self.scroll.bounds().size.height;
+        let offset = self.scroll.offset();
+        let y = if down {
+            offset.y - view
+        } else {
+            offset.y + view
+        };
+        let furthest = self.scroll.max_offset().y.max(px(0.));
+        self.scroll
+            .set_offset(point(offset.x, y.clamp(-furthest, px(0.))));
+        self.vertical(if down { rows } else { -rows }, extend, cx);
     }
 
     // ----- Clipboard and history ---------------------------------------------------------------
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_out(cx);
+    }
+
+    /// Copies the selection. Returns false only if there was something to copy and it did not
+    /// reach the clipboard; the user is told.
+    fn copy_out(&mut self, cx: &mut Context<Self>) -> bool {
+        let copied = self.write_selection(cx);
+        if !copied {
+            cx.emit(EditorEvent::Problem(crate::clipboard::BUSY));
+        }
+        copied
+    }
+
+    fn write_selection(&mut self, cx: &mut Context<Self>) -> bool {
         if self.editor.has_multiple_carets() {
             // Like VS Code: every selection's text, one per line, in document order.
             let mut selections = self.editor.selections();
@@ -805,31 +864,33 @@ impl EditorView {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            crate::clipboard::write_text(&text, cx);
+            let copied = crate::clipboard::write_text(&text, cx);
             cx.set_global(RichClipboard {
                 text,
                 fragment: None,
             });
-            return;
+            return copied;
         }
         if self.editor.selection().is_collapsed() {
-            return;
+            return true;
         }
         let fragment = self.editor.copy();
         let text = fragment.plain_text();
-        crate::clipboard::write_text(&text, cx);
+        let copied = crate::clipboard::write_text(&text, cx);
         cx.set_global(RichClipboard {
             text,
             fragment: Some(fragment),
         });
+        copied
     }
 
-    fn cut(&mut self, action: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = action;
-        self.copy(&Copy, window, cx);
-        self.run_horizontal(cx, |ed| {
-            ed.cut();
-        });
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        // Text that did not reach the clipboard stays in the note.
+        if self.copy_out(cx) {
+            self.run_horizontal(cx, |ed| {
+                ed.cut();
+            });
+        }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -1874,9 +1935,21 @@ impl Focusable for EditorView {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let caret_for = Some((self.editor.version(), self.editor.selection()));
+        if self.blink_for != caret_for {
+            self.blink_for = caret_for;
+            self.blink.reset();
+        }
+        let blinking = self.focus_handle.is_focused(window) && window.is_window_active();
+        self.blink
+            .run(blinking, |view: &mut Self| &mut view.blink, cx);
         if EditorSettings::get(cx).spellcheck {
             self.spelling.update(self.editor.doc());
+            if self.spelling.pending() {
+                // The rest of a long note is checked over the next frames.
+                window.request_animation_frame();
+            }
         }
         let wrap = EditorSettings::get(cx).wrap;
         let scrollbar = if wrap {
@@ -1922,6 +1995,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::doc_end))
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::select_page_up))
+            .on_action(cx.listener(Self::select_page_down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_up))
@@ -2000,6 +2075,7 @@ impl Render for EditorView {
                     .right_0()
                     .bottom(if horizontal_shown { px(12.) } else { px(0.) })
                     .w(px(12.))
+                    .cursor_default()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::vscrollbar_mouse_down))
                     .child(
                         div()
@@ -2073,6 +2149,7 @@ impl Render for EditorView {
                     .right(if vertical_shown { px(12.) } else { px(0.) })
                     .bottom_0()
                     .h(px(12.))
+                    .cursor_default()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::scrollbar_mouse_down))
                     .child(
                         div()

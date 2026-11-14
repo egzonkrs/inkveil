@@ -2,19 +2,25 @@
 //! model works, shows the suggestion, and replaces the selection when the user accepts it.
 
 use std::{
+    cell::Cell,
     ops::Range,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
-use gpui::{AnyElement, Context, IntoElement, Task, Window, div, prelude::*, px, relative};
+use gpui::{
+    AnyElement, Bounds, Context, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent, Pixels,
+    Point, Size, Task, Window, canvas, div, point, prelude::*, px, relative,
+};
 use inkveil_doc::Selection;
+use inkveil_store::NoteId;
 
 use super::note_editor::{NoteEditor, NoteEditorEvent};
 use crate::{
     ai::{self, AiConfig, AiMode},
     assets::Icon,
     theme::theme,
-    ui::{button, icon, icon_button},
+    ui::{Tooltip, button, icon, icon_button},
 };
 
 enum State {
@@ -68,6 +74,8 @@ impl Working {
             }
             ai::Progress::Thinking => self.phase = Phase::Thinking,
             ai::Progress::Writing { chars } => self.phase = Phase::Writing(chars),
+            // Only the chat shows these.
+            ai::Progress::Piece(_) | ai::Progress::Usage(_) => {}
             ai::Progress::Retrying {
                 retry,
                 reason,
@@ -83,6 +91,64 @@ impl Working {
     }
 }
 
+/// The AI window being dragged. A split shows two notes, so it says whose window it is.
+#[derive(Debug, Clone, Copy)]
+pub struct DraggedAiPanel {
+    note: NoteId,
+}
+
+/// Measured while painting: the size of the editor area and where the AI window is on screen.
+#[derive(Clone, Default)]
+pub struct AiGeometry {
+    area: Rc<Cell<Size<Pixels>>>,
+    panel: Rc<Cell<Bounds<Pixels>>>,
+}
+
+impl AiGeometry {
+    /// Keeps `slot` up to date with the bounds of the element it fills. A change redraws the note,
+    /// since the window's place depends on it.
+    fn probe<T: Copy + PartialEq + 'static>(
+        slot: Rc<Cell<T>>,
+        read: fn(Bounds<Pixels>) -> T,
+        cx: &Context<NoteEditor>,
+    ) -> impl IntoElement + use<T> {
+        let note = cx.entity_id();
+        canvas(
+            move |bounds, _, cx| {
+                let value = read(bounds);
+                if slot.replace(value) != value {
+                    cx.defer(move |cx| cx.notify(note));
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// Goes inside the editor area.
+    pub fn area_probe(&self, cx: &Context<NoteEditor>) -> impl IntoElement + use<> {
+        Self::probe(self.area.clone(), |bounds| bounds.size, cx)
+    }
+
+    fn panel_probe(&self, cx: &Context<NoteEditor>) -> impl IntoElement + use<> {
+        // The probe fills the inside of the window's 1 px border.
+        Self::probe(self.panel.clone(), |bounds| bounds.dilate(px(1.)), cx)
+    }
+}
+
+/// `position` moved as little as needed for a window of `panel` size to fit inside `area`. If it
+/// cannot fit, its top left stays visible, so its title can still be reached.
+fn clamp_panel(position: Point<Pixels>, panel: Size<Pixels>, area: Size<Pixels>) -> Point<Pixels> {
+    let limit = |at: Pixels, size: Pixels, space: Pixels| at.min(space - size).max(px(0.));
+    point(
+        limit(position.x, panel.width, area.width),
+        limit(position.y, panel.height, area.height),
+    )
+}
+
 /// The suggestion card of one open note.
 pub struct AiPanel {
     mode: AiMode,
@@ -92,6 +158,27 @@ pub struct AiPanel {
     version: u64,
     state: State,
     _request: Option<Task<()>>,
+}
+
+#[cfg(test)]
+impl AiPanel {
+    /// A window showing a finished suggestion, as if a reply had arrived.
+    pub fn with_suggestion(text: &str) -> Self {
+        Self {
+            mode: AiMode::Improve,
+            original: String::new(),
+            selection: Selection {
+                anchor: inkveil_doc::Pos::new(0, 0),
+                head: inkveil_doc::Pos::new(0, 0),
+            },
+            version: 0,
+            state: State::Ready {
+                text: text.to_owned(),
+                changed: Vec::new(),
+            },
+            _request: None,
+        }
+    }
 }
 
 impl NoteEditor {
@@ -357,6 +444,27 @@ impl NoteEditor {
         cx.notify();
     }
 
+    /// Notes where in the window the mouse took hold of it, for a drag that may follow.
+    fn grab_ai(&mut self, event: &MouseDownEvent) {
+        self.ai_grab = event.position - self.ai_geometry.panel.get().origin;
+    }
+
+    /// Moves the AI window with the mouse, keeping it inside the editor area.
+    pub fn on_ai_drag(
+        &mut self,
+        event: &DragMoveEvent<DraggedAiPanel>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.drag(cx).note != self.id {
+            return;
+        }
+        let wanted = event.event.position - self.ai_grab - event.bounds.origin;
+        let panel = self.ai_geometry.panel.get().size;
+        self.ai_position = Some(clamp_panel(wanted, panel, event.bounds.size));
+        cx.notify();
+    }
+
     pub fn close_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ai = None;
         self.editor.update(cx, |e, cx| e.focus(window, cx));
@@ -451,6 +559,7 @@ impl NoteEditor {
             State::Ready { text, changed } => div()
                 .id("ai-suggestion")
                 .max_h(px(360.))
+                .min_h_0()
                 .overflow_y_scroll()
                 .p_3()
                 .rounded_md()
@@ -474,14 +583,27 @@ impl NoteEditor {
         };
         let ready = matches!(panel.state, State::Ready { .. });
         let top = if self.find_open() { px(96.) } else { px(6.) };
+        let position = self.ai_position.map(|p| {
+            clamp_panel(
+                p,
+                self.ai_geometry.panel.get().size,
+                self.ai_geometry.area.get(),
+            )
+        });
+        let note = self.id;
         Some(
             div()
                 .id("ai-panel")
+                .debug_selector(|| "ai-panel".to_owned())
                 .occlude()
                 .absolute()
-                .top(top)
-                .right(px(28.))
+                .map(|d| match position {
+                    Some(at) => d.left(at.x).top(at.y),
+                    None => d.top(top).right(px(28.)),
+                })
                 .w(px(560.))
+                .max_w(relative(1.))
+                .max_h(relative(1.))
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -492,17 +614,41 @@ impl NoteEditor {
                 .bg(colors.surface)
                 .shadow_lg()
                 .text_size(px(13.))
+                .child(self.ai_geometry.panel_probe(cx))
                 .child(
                     div()
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap_2()
-                        .child(icon(header_icon, colors.accent))
                         .child(
+                            // Hold here to move the window and see what is behind it.
                             div()
+                                .id("ai-move")
+                                .debug_selector(|| "ai-move".to_owned())
+                                .flex()
                                 .flex_1()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(header_title),
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .h(px(28.))
+                                .cursor_grab()
+                                .child(icon(header_icon, colors.accent))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(header_title),
+                                )
+                                .child(icon(Icon::Grip, colors.muted).size(px(14.)))
+                                .tooltip(|_, cx| Tooltip::view("Drag to move", cx))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event, _, _| this.grab_ai(event)),
+                                )
+                                .on_drag(DraggedAiPanel { note }, |_, _, _, cx| {
+                                    cx.new(|_| gpui::Empty)
+                                }),
                         )
                         .child(
                             icon_button(
@@ -694,4 +840,40 @@ impl NoteEditor {
 /// The model's name, such as "Grok 4.7", or its id for a model typed in by hand.
 fn model_name(id: &str) -> &str {
     ai::model_choice(id).map_or(id, |m| m.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::size;
+
+    use super::*;
+
+    fn panel() -> Size<Pixels> {
+        size(px(560.), px(300.))
+    }
+
+    fn area() -> Size<Pixels> {
+        size(px(1000.), px(700.))
+    }
+
+    #[test]
+    fn a_window_that_fits_stays_where_it_was_dropped() {
+        let at = point(px(120.), px(80.));
+        assert_eq!(clamp_panel(at, panel(), area()), at);
+    }
+
+    #[test]
+    fn the_window_cannot_leave_the_editor() {
+        let far = point(px(5000.), px(5000.));
+        assert_eq!(clamp_panel(far, panel(), area()), point(px(440.), px(400.)));
+        let before = point(px(-50.), px(-50.));
+        assert_eq!(clamp_panel(before, panel(), area()), point(px(0.), px(0.)));
+    }
+
+    #[test]
+    fn a_window_larger_than_the_editor_keeps_its_title_visible() {
+        let small = size(px(400.), px(200.));
+        let at = point(px(300.), px(300.));
+        assert_eq!(clamp_panel(at, panel(), small), point(px(0.), px(0.)));
+    }
 }

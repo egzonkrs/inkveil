@@ -19,6 +19,24 @@ impl Default for Document {
     }
 }
 
+/// Adds a block's text as [`Document::plain_text`] gives it.
+fn push_block_text(out: &mut String, block: &Block) {
+    match block {
+        Block::Text(t) => out.push_str(t.text.as_str()),
+        Block::Divider => out.push_str("---"),
+        Block::Image(_) => {}
+        Block::Table(table) => {
+            for (r, row) in table.rows().iter().enumerate() {
+                if r > 0 {
+                    out.push('\n');
+                }
+                let cells: Vec<&str> = row.iter().map(RichText::as_str).collect();
+                out.push_str(&cells.join("\t"));
+            }
+        }
+    }
+}
+
 impl Document {
     /// A document with one empty paragraph.
     pub fn new() -> Self {
@@ -130,22 +148,23 @@ impl Document {
             if i > 0 {
                 out.push('\n');
             }
-            match block.as_ref() {
-                Block::Text(t) => out.push_str(t.text.as_str()),
-                Block::Divider => out.push_str("---"),
-                Block::Image(_) => {}
-                Block::Table(table) => {
-                    for (r, row) in table.rows().iter().enumerate() {
-                        if r > 0 {
-                            out.push('\n');
-                        }
-                        let cells: Vec<&str> = row.iter().map(RichText::as_str).collect();
-                        out.push_str(&cells.join("\t"));
-                    }
-                }
-            }
+            push_block_text(&mut out, block);
         }
         out
+    }
+
+    /// The first line of [`Self::plain_text`] that `wanted` accepts, without building the text
+    /// of the whole document.
+    pub fn first_line(&self, wanted: impl Fn(&str) -> bool) -> Option<String> {
+        let mut text = String::new();
+        for block in &self.blocks {
+            text.clear();
+            push_block_text(&mut text, block);
+            if let Some(line) = text.lines().find(|line| wanted(line)) {
+                return Some(line.to_owned());
+            }
+        }
+        None
     }
 
     /// Counts whitespace-delimited words across all text and table blocks without allocating.

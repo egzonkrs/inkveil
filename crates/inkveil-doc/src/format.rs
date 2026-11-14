@@ -22,6 +22,13 @@ enum StoredDoc {
     V1(Vec<Block>),
 }
 
+/// [`StoredDoc`] for writing: the same bytes, from blocks that are only borrowed, so encoding
+/// does not copy the document first. Its variants must stay in step with [`StoredDoc`].
+#[derive(Serialize)]
+enum StoredDocRef<'a> {
+    V1(Vec<&'a Block>),
+}
+
 impl Document {
     /// Encodes the document for storage, into a buffer that is wiped when dropped (as is every
     /// intermediate buffer).
@@ -30,9 +37,11 @@ impl Document {
     ///
     /// If the document is larger than 1 GiB encoded.
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let blocks: Vec<Block> = self.blocks.iter().map(|b| b.as_ref().clone()).collect();
-        let stored = StoredDoc::V1(blocks);
-        let mut capacity = 4096;
+        let stored = StoredDocRef::V1(self.blocks.iter().map(AsRef::as_ref).collect());
+        // Roomy enough for most notes on the first try: the text, and as much again for its
+        // formatting and structure. The loop below grows it when that is not enough.
+        let text: usize = self.blocks.iter().map(|block| text_len(block)).sum();
+        let mut capacity = (text * 2 + self.blocks.len() * 64).max(4096);
         loop {
             let mut buffer = Zeroizing::new(vec![0u8; capacity]);
             match postcard::to_slice(&stored, &mut buffer) {
@@ -63,10 +72,37 @@ impl Document {
     }
 }
 
+/// How many bytes of text a block holds.
+fn text_len(block: &Block) -> usize {
+    match block {
+        Block::Text(t) => t.text.as_str().len(),
+        Block::Divider | Block::Image(_) => 0,
+        Block::Table(table) => table
+            .rows()
+            .iter()
+            .flatten()
+            .map(|cell| cell.as_str().len())
+            .sum(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Marks, RichText, Table, TextBlock, TextKind};
+
+    #[test]
+    fn encoding_writes_exactly_the_stored_layout() {
+        // Notes on disk were written from `StoredDoc`; the borrowed form must not differ by
+        // a single byte, for small notes and for ones that need a bigger buffer.
+        for text in ["", "short", &"a long line of text. ".repeat(4000)] {
+            let mut doc = Document::from_plain_text(text);
+            doc.blocks.push(std::sync::Arc::new(Block::Divider));
+            let owned: Vec<Block> = doc.blocks.iter().map(|b| b.as_ref().clone()).collect();
+            let expected = postcard::to_stdvec(&StoredDoc::V1(owned)).unwrap();
+            assert_eq!(doc.encode().as_slice(), expected.as_slice());
+        }
+    }
 
     #[test]
     fn roundtrip() {

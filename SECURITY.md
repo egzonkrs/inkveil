@@ -44,20 +44,29 @@ this repository rather than in a public issue.
   memory while on screen; decoded pictures are dropped when the vault locks. Decoding runs with
   size limits. Copying a picture marks it like copied text. Saving a picture as a file writes an
   unencrypted copy where you choose; the menu says so. Pictures are never sent to the AI.
-- **Notes leaking through the AI features.** "Improve" and "Humanize" are off until you add an
-  OpenRouter API key. They send only the text you selected, only when you click them, after a
-  check for keys, passwords and other secrets in it, over HTTPS to `openrouter.ai` (no redirects,
-  no cookies, bundled root certificates), and ask OpenRouter to route only to providers that do
-  not collect prompts. Titles, tags and the rest of the note are never sent. The key is stored
-  encrypted in the vault and cleared from memory when it locks. Text you do send is handled under
-  the policies of OpenRouter and of the provider that runs the model you chose, not Inkveil's. Replies are streamed; any reasoning the
-  provider streams back only shows that the model is busy and is discarded, never stored or shown.
+- **Notes leaking through the AI features.** "Improve", "Humanize" and the chat are off until you
+  add an OpenRouter API key. Improve and Humanize send only the text you selected and the chat
+  only what you type, only when you click or press Enter, after a check for keys, passwords and
+  other secrets in it, over HTTPS to `openrouter.ai` (no redirects, no cookies, bundled root
+  certificates). Every request sets `provider.zdr` and `data_collection: deny`, so OpenRouter
+  routes it only to endpoints with zero data retention or refuses it. That is their promise, which
+  Inkveil cannot verify. Titles, tags and the rest of the note are never sent. The key is stored
+  encrypted in the vault and cleared from memory when it locks. Text you do send is readable by
+  OpenRouter and the provider while they process it and is handled under their policies, not
+  Inkveil's; an account's own Input & output logging setting stores prompts regardless of what the
+  request asks. Replies are streamed; any reasoning the provider streams back only shows that the
+  model is busy and is discarded, never stored or shown.
+- **Chat history.** The chat's conversation exists only in memory, in buffers wiped on drop, and is
+  never written to the vault or to disk. It is dropped when the vault locks and when the app
+  closes. While it is on screen, copies made for drawing are ordinary memory, like open notes.
+  Text copied from the chat is marked like other copied text. Request costs and token counts
+  stay in memory with the conversation.
 - **Hidden text in AI requests and replies.** Invisible tag characters and supplementary
   variation selectors, which models can read but you cannot see (a way to smuggle instructions
   into pasted text), are removed from what is sent unless they belong to an emoji. Invisible
   characters in the reply (zero-width spaces and joiners, direction marks, tags) are removed
-  before you see the suggestion, again except inside emoji. Nothing changes your note until you
-  accept the highlighted suggestion.
+  before you see the suggestion or chat reply, again except inside emoji. Nothing changes your
+  note until you accept the highlighted suggestion; the chat never changes a note.
 - **Losing notes to crashes or power cuts.** Every save is one durable SQLite transaction and is
   confirmed before the app shows "Saved"; failed saves are retried; history, daily backups and two
   copies of the key header are kept. Nothing is deleted without confirmation.
@@ -89,6 +98,12 @@ this repository rather than in a public issue.
   is unlocked, and Windows may write it to the page file or hiberfil.sys. Full-disk encryption
   (BitLocker) protects those files.
 - **Someone at your unlocked computer** before auto-lock triggers.
+- **The window's size.** Whether the window was maximized, and its size, are kept in a plain
+  file (`window-state`) beside the vault folder, so the window opens the way it was closed while
+  the vault is still locked. It holds nothing about your notes. Text typed into the chat's
+  question field, a title, the search and other fields can be undone with Ctrl+Z; those earlier
+  versions live in memory, in buffers wiped on drop, until the field is cleared or the vault
+  locks. Password and API key fields keep none.
 - **A forgotten password with no recovery key.** There is no back door. Keep your recovery key
   somewhere safe.
 - **Old copies after a password change.** Changing the password deletes the vault's own backups,

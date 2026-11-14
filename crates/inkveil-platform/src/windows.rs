@@ -318,9 +318,7 @@ pub(crate) fn write_private_clipboard_image(png: &[u8], dib: &[u8]) -> Result<u3
 
 /// Writes `entries` (format, bytes) to the clipboard after the privacy markers.
 fn write_private_clipboard(entries: &[(u32, &[u8])]) -> Result<u32, PlatformError> {
-    // SAFETY: opening the clipboard with no owner window is allowed; it is closed by the guard.
-    unsafe { OpenClipboard(None) }.map_err(|e| PlatformError::new("OpenClipboard", e))?;
-    let guard = ClipboardGuard;
+    let guard = open_clipboard()?;
 
     // SAFETY: we hold the clipboard open.
     unsafe { EmptyClipboard() }.map_err(|e| PlatformError::new("EmptyClipboard", e))?;
@@ -366,9 +364,7 @@ pub(crate) fn clipboard_sequence() -> u32 {
 
 /// Empties the clipboard.
 pub(crate) fn clear_clipboard() -> Result<(), PlatformError> {
-    // SAFETY: as in `write_private_clipboard_text`.
-    unsafe { OpenClipboard(None) }.map_err(|e| PlatformError::new("OpenClipboard", e))?;
-    let _guard = ClipboardGuard;
+    let _guard = open_clipboard()?;
     // SAFETY: we hold the clipboard open.
     unsafe { EmptyClipboard() }.map_err(|e| PlatformError::new("EmptyClipboard", e))
 }
@@ -383,6 +379,29 @@ fn set_clipboard_data(format: u32, bytes: &[u8]) -> Result<(), PlatformError> {
         return Err(PlatformError::new("SetClipboardData", e));
     }
     Ok(())
+}
+
+/// How often opening the clipboard is tried, and how long to wait in between. Only one program
+/// can have the clipboard open; clipboard managers and remote desktop hold it for a moment after
+/// every copy, so a single try fails now and then.
+const CLIPBOARD_TRIES: u32 = 10;
+const CLIPBOARD_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Opens the clipboard, waiting a little if another program has it open.
+fn open_clipboard() -> Result<ClipboardGuard, PlatformError> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        // SAFETY: opening the clipboard with no owner window is allowed; it is closed by the
+        // guard.
+        match unsafe { OpenClipboard(None) } {
+            Ok(()) => return Ok(ClipboardGuard),
+            Err(e) if tries == CLIPBOARD_TRIES => {
+                return Err(PlatformError::new("OpenClipboard", e));
+            }
+            Err(_) => std::thread::sleep(CLIPBOARD_WAIT),
+        }
+    }
 }
 
 /// Closes the clipboard when dropped.

@@ -1,5 +1,7 @@
 //! Small reusable UI pieces.
 
+pub mod blink;
+pub mod scrollbar;
 pub mod text_field;
 
 use gpui::{
@@ -26,6 +28,19 @@ pub fn icon_button(
     tooltip: &'static str,
     cx: &App,
 ) -> Stateful<gpui::Div> {
+    icon_button_state(id, which, active, true, tooltip, cx)
+}
+
+/// An [`icon_button`] that can be unavailable: dimmed, with the plain arrow and no hover or
+/// pressed look, so it does not invite a click that would do nothing.
+pub fn icon_button_state(
+    id: impl Into<ElementId>,
+    which: Icon,
+    active: bool,
+    enabled: bool,
+    tooltip: &'static str,
+    cx: &App,
+) -> Stateful<gpui::Div> {
     let colors = theme(cx);
     let color = if active { colors.accent } else { colors.icon };
     div()
@@ -36,10 +51,18 @@ pub fn icon_button(
         .justify_center()
         .size(px(28.))
         .rounded_md()
-        .cursor_pointer()
         .text_color(if active { colors.accent } else { colors.icon })
         .when(active, |d| d.bg(colors.selected))
-        .hover(|d| d.bg(colors.hover))
+        .map(|d| {
+            if enabled {
+                d.cursor_pointer()
+                    .hover(|d| d.bg(colors.hover))
+                    // While the mouse button is down, so a press is seen to land.
+                    .active(|d| d.bg(colors.selected))
+            } else {
+                d.opacity(0.4)
+            }
+        })
         .tooltip(move |_, cx| Tooltip::view(tooltip, cx))
         .child(icon(which, color))
 }
@@ -67,12 +90,14 @@ pub fn button(
             d.bg(colors.accent)
                 .text_color(gpui::white())
                 .hover(|d| d.opacity(0.9))
+                .active(|d| d.opacity(0.75))
         })
         .when(!primary, |d| {
             d.border_1()
                 .border_color(colors.border)
                 .text_color(colors.text)
                 .hover(|d| d.bg(colors.hover))
+                .active(|d| d.bg(colors.selected))
         })
         .child(label)
 }

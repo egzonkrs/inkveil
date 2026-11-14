@@ -153,6 +153,9 @@ impl Element for EditorElement {
             }
         });
         let focused = focus_handle.is_focused(window);
+        // It only blinks while the window is in front; behind another window it stays on.
+        let caret_on =
+            focused && (!window.is_window_active() || self.view.read(cx).caret_visible());
 
         // Borrow the layout out of the view so painting can use `cx` freely.
         let (layout, selection, others, doc_empty, has_find) = self.view.update(cx, |view, _| {
@@ -327,7 +330,7 @@ impl Element for EditorElement {
             );
         }
 
-        if focused {
+        if caret_on {
             for head in std::iter::once(selection.head).chain(others.iter().map(|s| s.head)) {
                 if let Some((caret, height)) = layout.caret(head) {
                     window.paint_quad(fill(

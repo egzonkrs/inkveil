@@ -78,6 +78,8 @@ pub enum NoteEditorEvent {
     DictionaryChanged,
     /// "Improve with AI" needs an API key first.
     AiSettingsRequested,
+    /// The Chat button was clicked.
+    ChatToggled,
     /// Something went wrong that the user should see (e.g. a picture could not be read).
     Problem(SharedString),
 }
@@ -112,14 +114,29 @@ pub struct NoteEditor {
     pub(super) editor: Entity<EditorView>,
     link_field: Entity<TextField>,
     open_menu: Option<Menu>,
+    /// The mouse press being handled is on the button of this menu. The menu then leaves
+    /// closing to its button: closing on the press and toggling on the click would open it
+    /// again.
+    press_on_menu: Option<Menu>,
     context_menu: Option<ContextMenu>,
     pub(super) storage: Storage,
     pub(super) history: Option<super::history::History>,
     pub(super) find: Option<super::find::FindBar>,
     pub(super) ai: Option<super::ai_panel::AiPanel>,
+    /// Where the AI window was dragged to, from the top left of the editor area. It stays there
+    /// for the next request on this note. `None` is the usual place, at the top right.
+    pub(super) ai_position: Option<Point<Pixels>>,
+    pub(super) ai_geometry: super::ai_panel::AiGeometry,
+    /// Where in the AI window the mouse took hold of it.
+    pub(super) ai_grab: Point<Pixels>,
+    /// The chat, when it is showing in this note's editor instead of the note.
+    chat: Option<Entity<super::chat::ChatPanel>>,
     pub(super) zoom: Option<super::pictures::Zoom>,
     pub(super) picture_menu: Option<super::pictures::PictureMenu>,
     word_count: usize,
+    /// The text changed since the words were counted. They are counted again a few times a
+    /// second, not on every key: it reads the whole note.
+    word_count_stale: bool,
     saved_version: u64,
     meta_dirty: bool,
     /// Title or tags were edited: counts as a modification, unlike pinning or moving.
@@ -153,13 +170,16 @@ impl NoteEditor {
                 title: String::new(),
                 ..meta.clone()
             });
-            let mut field = TextField::new(placeholder, window, cx).borderless();
+            let mut field = TextField::new(placeholder, window, cx)
+                .borderless()
+                .max_chars(MAX_TITLE_CHARS);
             field.set_text(&meta.title, cx);
             field
         });
         let tags = cx.new(|cx| {
-            let mut field =
-                TextField::new("Add tags, separated by commas…", window, cx).borderless();
+            let mut field = TextField::new("Add tags, separated by commas…", window, cx)
+                .borderless()
+                .max_chars(MAX_TAGS_CHARS);
             field.set_text(&meta.tags.join(", "), cx);
             field
         });
@@ -203,7 +223,7 @@ impl NoteEditor {
         .detach();
         cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
             EditorEvent::Changed => {
-                this.word_count = this.editor.read(cx).doc().word_count();
+                this.word_count_stale = true;
                 if this.find_open() {
                     this.refresh_find(false, cx);
                 }
@@ -219,6 +239,7 @@ impl NoteEditor {
                 this.open_picture_menu(*index, *position, cx);
             }
             EditorEvent::PasteImage(bytes) => this.insert_picture(bytes.clone(), window, cx),
+            EditorEvent::Problem(message) => cx.emit(NoteEditorEvent::Problem((*message).into())),
             EditorEvent::ContextMenu {
                 position,
                 misspelled,
@@ -248,14 +269,20 @@ impl NoteEditor {
             editor,
             link_field,
             open_menu: None,
+            press_on_menu: None,
             context_menu: None,
             storage,
             history: None,
             find: None,
             ai: None,
+            ai_position: None,
+            ai_geometry: super::ai_panel::AiGeometry::default(),
+            ai_grab: Point::default(),
+            chat: None,
             zoom: None,
             picture_menu: None,
             word_count,
+            word_count_stale: false,
             saved_version: 0,
             meta_dirty: false,
             title_or_tags_changed: false,
@@ -293,6 +320,17 @@ impl NoteEditor {
 
     pub fn word_count(&self) -> usize {
         self.word_count
+    }
+
+    /// Counts the words again if the text changed since the last count.
+    pub fn refresh_word_count(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.word_count_stale) {
+            let count = self.editor.read(cx).doc().word_count();
+            if count != self.word_count {
+                self.word_count = count;
+                cx.notify();
+            }
+        }
     }
 
     /// Whether the last save changed the preview (and so maybe the displayed title).
@@ -412,7 +450,7 @@ impl NoteEditor {
             self.meta.modified_ms = now_ms();
         }
         let body = editor.doc().encode();
-        let preview = preview_of(&editor.doc().plain_text());
+        let preview = preview_of(editor.doc());
         self.saved_version = version;
         if preview != self.meta.preview {
             self.meta.preview = preview;
@@ -453,6 +491,32 @@ impl NoteEditor {
         self.open_menu = None;
         self.editor.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
+    }
+
+    /// Whether a menu of this note or a picture shown large is open: nothing to type into.
+    pub fn menu_open(&self) -> bool {
+        self.context_menu.is_some()
+            || self.picture_menu.is_some()
+            || self.zoom.is_some()
+            || self.open_menu.is_some_and(|menu| menu != Menu::Link)
+    }
+
+    /// Whether the popup for a link's address is open.
+    pub fn link_popup_open(&self) -> bool {
+        self.open_menu == Some(Menu::Link)
+    }
+
+    /// Closes the right-click menu, toolbar menu or link popup of this note (Escape). Returns
+    /// whether one was open.
+    pub fn dismiss_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.context_menu.is_some() {
+            self.close_context_menu(window, cx);
+        } else if self.open_menu.is_some() {
+            self.close_menu(window, cx);
+        } else {
+            return false;
+        }
+        true
     }
 
     fn open_link_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -536,23 +600,36 @@ impl NoteEditor {
         div()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap(px(2.))
             .px(px(40.))
-            .h(px(40.))
+            .py(px(6.))
             .flex_none()
             .child(
-                icon_button("undo", Icon::Undo, false, "Undo (Ctrl+Z)", cx)
-                    .when(!can_undo, |b| b.opacity(0.4))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.edit(window, cx, super::super::editor::EditorView::undo);
-                    })),
+                crate::ui::icon_button_state(
+                    "undo",
+                    Icon::Undo,
+                    false,
+                    can_undo,
+                    "Undo (Ctrl+Z)",
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.edit(window, cx, super::super::editor::EditorView::undo);
+                })),
             )
             .child(
-                icon_button("redo", Icon::Redo, false, "Redo (Ctrl+Y)", cx)
-                    .when(!can_redo, |b| b.opacity(0.4))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.edit(window, cx, super::super::editor::EditorView::redo);
-                    })),
+                crate::ui::icon_button_state(
+                    "redo",
+                    Icon::Redo,
+                    false,
+                    can_redo,
+                    "Redo (Ctrl+Y)",
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.edit(window, cx, super::super::editor::EditorView::redo);
+                })),
             )
             .child(toolbar_separator(cx))
             .child(
@@ -625,6 +702,7 @@ impl NoteEditor {
                         "Link (Ctrl+K)",
                         cx,
                     )
+                    .debug_selector(|| "link-button".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.open_menu == Some(Menu::Link) {
                             this.close_menu(window, cx);
@@ -768,7 +846,7 @@ impl NoteEditor {
                     );
                 })),
             )
-            // Improve with AI and Humanize sit at the far right end of the toolbar.
+            // Improve with AI, Humanize and Chat sit at the far right end of the toolbar.
             .child(div().flex_1().min_w(px(8.)))
             .child(self.ai_button(
                 AiMode::Improve,
@@ -782,6 +860,85 @@ impl NoteEditor {
                 "Rewrite the selection in plain, natural words, as if you typed it",
                 cx,
             ))
+            .child(self.chat_button(cx))
+    }
+
+    /// What is left of the toolbar while the chat fills the editor: formatting a note that is not
+    /// on screen would be confusing. Chat stays exactly where it was, to go back.
+    fn render_chat_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .px(px(40.))
+            .py(px(6.))
+            .flex_none()
+            .child(div().flex_1().min_w(px(8.)))
+            .child(self.chat_button(cx))
+    }
+
+    /// A labelled button at the right end of the toolbar.
+    fn toolbar_pill(
+        id: &'static str,
+        which: Icon,
+        label: &'static str,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = theme(cx);
+        div()
+            .debug_selector(|| id.to_owned())
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(28.))
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .cursor_pointer()
+            .text_size(px(12.))
+            .text_color(colors.text)
+            .hover(|d| d.bg(colors.hover))
+            .child(icon(which, colors.accent).size(px(14.)))
+            .child(label)
+    }
+
+    /// The Chat button at the right end of the toolbar.
+    fn chat_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = theme(cx);
+        let open = self.chat_open();
+        Self::toolbar_pill("open-chat", Icon::MessageCircle, "Chat", cx)
+            .when(open, |d| d.bg(colors.selected))
+            .tooltip(move |_, cx| {
+                crate::ui::Tooltip::view(
+                    if open {
+                        "Back to the note (Ctrl+J)"
+                    } else {
+                        "Chat with Grok (Ctrl+J)"
+                    },
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(NoteEditorEvent::ChatToggled)))
+    }
+
+    pub fn chat_open(&self) -> bool {
+        self.chat.is_some()
+    }
+
+    /// Shows the chat in this note's editor.
+    pub fn show_chat(&mut self, chat: Entity<super::chat::ChatPanel>, cx: &mut Context<Self>) {
+        self.chat = Some(chat);
+        cx.notify();
+    }
+
+    /// Shows the note again.
+    pub fn hide_chat(&mut self, cx: &mut Context<Self>) {
+        if self.chat.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The Improve or Humanize button at the right end of the toolbar.
@@ -797,23 +954,9 @@ impl NoteEditor {
             AiMode::Improve => ("improve-ai", Icon::Sparkles, "Improve"),
             AiMode::Humanize => ("humanize-ai", Icon::NotebookPen, "Humanize"),
         };
-        div()
-            .id(id)
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .h(px(28.))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border)
-            .cursor_pointer()
-            .text_size(px(12.))
-            .text_color(colors.text)
+        Self::toolbar_pill(id, icon_name, label, cx)
             .when(!has_selection, |d| d.opacity(0.55))
             .when(self.ai_mode() == Some(mode), |d| d.bg(colors.selected))
-            .hover(|d| d.bg(colors.hover))
             .tooltip(move |_, cx| {
                 crate::ui::Tooltip::view(
                     if has_selection {
@@ -824,8 +967,6 @@ impl NoteEditor {
                     cx,
                 )
             })
-            .child(icon(icon_name, colors.accent).size(px(14.)))
-            .child(label)
             .on_click(cx.listener(move |this, _, window, cx| match mode {
                 AiMode::Improve => this.improve_selection(window, cx),
                 AiMode::Humanize => this.humanize_selection(window, cx),
@@ -840,24 +981,32 @@ impl NoteEditor {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let open = self.open_menu == Some(menu);
-        div().relative().child(control).when(open, |d| {
-            d.child(
-                div().absolute().top(px(32.)).left_0().child(
-                    deferred(
-                        anchored()
-                            .snap_to_window()
-                            .child(self.render_menu(menu, cx)),
-                    )
-                    .with_priority(1),
-                ),
-            )
-        })
+        let pressed = cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
+            this.press_on_menu = Some(menu);
+        });
+        div()
+            .relative()
+            .capture_any_mouse_down(pressed)
+            .child(control)
+            .when(open, |d| {
+                d.child(
+                    div().absolute().top(px(32.)).left_0().child(
+                        deferred(
+                            anchored()
+                                .snap_to_window()
+                                .child(self.render_menu(menu, cx)),
+                        )
+                        .with_priority(1),
+                    ),
+                )
+            })
     }
 
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> AnyElement {
         let colors = theme(cx);
         let panel = div()
             .id("menu")
+            .debug_selector(|| "toolbar-menu".to_owned())
             .occlude()
             .flex()
             .flex_col()
@@ -869,9 +1018,11 @@ impl NoteEditor {
             .bg(colors.background)
             .shadow_md()
             .text_size(px(13.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.open_menu = None;
-                cx.notify();
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.press_on_menu != Some(menu) {
+                    this.open_menu = None;
+                    cx.notify();
+                }
             }));
 
         match menu {
@@ -1096,14 +1247,18 @@ pub fn display_title(meta: &NoteMeta) -> SharedString {
     }
 }
 
+/// The longest title and tag list that can be typed or pasted. Both are stored with the
+/// note's details and drawn in the sidebar and the tab on every frame.
+const MAX_TITLE_CHARS: usize = 300;
+const MAX_TAGS_CHARS: usize = 600;
+
 /// The first non-empty line of a note, cut to a sidebar-sized length.
-fn preview_of(text: &str) -> String {
+fn preview_of(doc: &Document) -> String {
     const MAX_CHARS: usize = 100;
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && *l != "---")
-        .unwrap_or("");
+    let line = doc
+        .first_line(|line| !line.trim().is_empty() && line.trim() != "---")
+        .unwrap_or_default();
+    let line = line.trim();
     match line.char_indices().nth(MAX_CHARS) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
         None => line.to_owned(),
@@ -1142,6 +1297,8 @@ impl Render for NoteEditor {
             .flex_col()
             .bg(colors.background)
             .key_context(super::find::NOTE_CONTEXT)
+            // Runs before the listeners of anything inside: each press starts afresh.
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.press_on_menu = None))
             .on_action(cx.listener(Self::on_find))
             .on_action(cx.listener(Self::on_find_replace))
             .on_action(cx.listener(Self::on_find_next))
@@ -1239,14 +1396,20 @@ impl Render for NoteEditor {
                     ),
             )
             .child(div().pt_3().child(hairline(cx)))
-            .map(|d| match self.render_history(cx) {
-                Some(history) => d.child(history),
-                None => d.child(self.render_toolbar(cx)).child(hairline(cx)).child(
+            .map(|d| match (self.chat.clone(), self.render_history(cx)) {
+                (Some(chat), _) => d
+                    .child(self.render_chat_toolbar(cx))
+                    .child(hairline(cx))
+                    .child(div().flex_1().min_h_0().child(chat)),
+                (None, Some(history)) => d.child(history),
+                (None, None) => d.child(self.render_toolbar(cx)).child(hairline(cx)).child(
                     div()
                         .relative()
                         .flex_1()
                         .min_h_0()
                         .on_drop(cx.listener(Self::on_drop_files))
+                        .on_drag_move(cx.listener(Self::on_ai_drag))
+                        .when(self.ai_open(), |d| d.child(self.ai_geometry.area_probe(cx)))
                         .child(self.editor.clone())
                         .children(self.render_find(cx))
                         .children(self.render_ai(cx)),

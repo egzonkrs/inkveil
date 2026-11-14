@@ -128,9 +128,16 @@ pub fn clipboard_formats(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((png, dib))
 }
 
+/// Decoded pictures may take this much memory before ones that are not on screen are dropped.
+const CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// A picture nothing has asked for in this long is not on screen. One on screen is asked for on
+/// every frame.
+const CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Decoded pictures of the open notes, by attachment id, and the blurred backdrops of pictures
 /// shown large. Each picture is decoded once and reused, so opening one large again costs no
-/// memory. Emptied when the vault locks, which also frees their graphics memory.
+/// memory. Pictures that are not on screen are dropped once the cache is over its budget; all
+/// of it is emptied when the vault locks, which also frees their graphics memory.
 #[derive(Default)]
 pub struct ImageCache {
     images: HashMap<BlobId, Slot>,
@@ -139,8 +146,14 @@ pub struct ImageCache {
 
 enum Slot {
     Loading,
-    Ready(Arc<RenderImage>),
+    /// The picture, and when it was last asked for.
+    Ready(Arc<RenderImage>, std::time::Instant),
     Failed,
+}
+
+/// How much memory a decoded picture takes.
+fn decoded_bytes(image: &RenderImage) -> usize {
+    image.as_bytes(0).map_or(0, <[u8]>::len)
 }
 
 impl Global for ImageCache {}
@@ -156,8 +169,11 @@ impl ImageCache {
     /// The decoded picture, starting to load it if this is the first request.
     pub fn get(id: BlobId, cx: &mut App) -> Lookup {
         let cache = cx.default_global::<Self>();
-        match cache.images.get(&id) {
-            Some(Slot::Ready(image)) => return Lookup::Ready(image.clone()),
+        match cache.images.get_mut(&id) {
+            Some(Slot::Ready(image, used)) => {
+                *used = std::time::Instant::now();
+                return Lookup::Ready(image.clone());
+            }
             Some(Slot::Loading) => return Lookup::Loading,
             Some(Slot::Failed) => return Lookup::Failed,
             None => {}
@@ -178,13 +194,14 @@ impl ImageCache {
                 .await;
             cx.update(|cx| {
                 let slot = match decoded {
-                    Ok(image) => Slot::Ready(image),
+                    Ok(image) => Slot::Ready(image, std::time::Instant::now()),
                     Err(error) => {
                         tracing::warn!("could not show a picture: {error}");
                         Slot::Failed
                     }
                 };
                 cx.default_global::<Self>().images.insert(id, slot);
+                Self::trim(cx);
                 cx.refresh_windows();
             });
         })
@@ -195,7 +212,7 @@ impl ImageCache {
     /// The decoded picture if it is already loaded (without starting a load).
     pub fn ready(id: BlobId, cx: &App) -> Option<Arc<RenderImage>> {
         match cx.try_global::<Self>()?.images.get(&id)? {
-            Slot::Ready(image) => Some(image.clone()),
+            Slot::Ready(image, _) => Some(image.clone()),
             _ => None,
         }
     }
@@ -204,7 +221,52 @@ impl ImageCache {
     pub fn store(id: BlobId, image: Arc<RenderImage>, cx: &mut App) {
         cx.default_global::<Self>()
             .images
-            .insert(id, Slot::Ready(image));
+            .insert(id, Slot::Ready(image, std::time::Instant::now()));
+        Self::trim(cx);
+    }
+
+    /// Drops pictures that are not on screen, oldest first, while the cache is over its budget.
+    /// They are decoded again when they come back into view.
+    fn trim(cx: &mut App) {
+        let cache = cx.default_global::<Self>();
+        let mut total: usize = cache
+            .images
+            .values()
+            .map(|slot| match slot {
+                Slot::Ready(image, _) => decoded_bytes(image),
+                _ => 0,
+            })
+            .sum();
+        if total <= CACHE_BUDGET_BYTES {
+            return;
+        }
+        let mut idle: Vec<(std::time::Instant, BlobId)> = cache
+            .images
+            .iter()
+            .filter_map(|(id, slot)| match slot {
+                Slot::Ready(_, used) if used.elapsed() >= CACHE_IDLE => Some((*used, *id)),
+                _ => None,
+            })
+            .collect();
+        idle.sort_unstable_by_key(|(used, _)| *used);
+        let mut dropped = Vec::new();
+        for (_, id) in idle {
+            if total <= CACHE_BUDGET_BYTES {
+                break;
+            }
+            if let Some(Slot::Ready(image, _)) = cache.images.remove(&id) {
+                total = total.saturating_sub(decoded_bytes(&image));
+                dropped.push(image);
+            }
+        }
+        // The window keeps its own copy for drawing until told otherwise.
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| {
+                for image in &dropped {
+                    let _ = window.drop_image(image.clone());
+                }
+            });
+        }
     }
 
     pub fn backdrop(id: BlobId, cx: &App) -> Option<Arc<RenderImage>> {
@@ -223,7 +285,7 @@ impl ImageCache {
             .images
             .into_values()
             .filter_map(|slot| match slot {
-                Slot::Ready(image) => Some(image),
+                Slot::Ready(image, _) => Some(image),
                 _ => None,
             })
             .chain(old.backdrops.into_values());
